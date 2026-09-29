@@ -3,6 +3,11 @@
 Anyone can use the bot. Every user's spendings live in their own directory
 (data/users/<telegram_id>/), and every handler resolves that directory from
 the sender's own Telegram ID, so users can never see each other's data.
+
+The files are encrypted with a key that only the user's password can unlock
+(see vault.py). The unlocked key is kept in memory only, so after a restart
+each user has to enter their password again. Data older than 12 months is
+deleted automatically.
 """
 from __future__ import annotations
 
@@ -11,8 +16,10 @@ import calendar
 import logging
 import os
 import re
+import shutil
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 from telegram import (
@@ -21,8 +28,10 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
+from cryptography.fernet import Fernet
 from telegram.error import Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     Application,
@@ -34,8 +43,9 @@ from telegram.ext import (
 )
 
 import texts as t
-from storage import SpendingStorage
+from storage import SpendingStorage, encrypt_legacy, purge_old, shift_month
 from users import UserRegistry
+from vault import MAX_PASSWORD, MIN_PASSWORD, Vault
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -50,9 +60,17 @@ TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tashkent"))
 WEEKLY_REPORT_AT = time(12, 0)   # every Sunday
 MONTHLY_REPORT_AT = time(21, 0)  # last day of every month
 MAX_ENTRIES_PER_MONTH = 3000     # per user; protects the server's disk
+RETENTION_MONTHS = 12            # keep the current month plus this many earlier months
+PURGE_AT = time(3, 0)            # daily cleanup of expired months
+MAX_PASSWORD_FAILS = 5
+LOCKOUT_SECONDS = 600
+MAX_PENDING = 20         # messages held in memory while a user is locked
 TG_LIMIT = 4000
 
 users = UserRegistry(DATA_DIR / "users.json")
+
+# Unlocked data keys, in memory only. Never written to disk or logged.
+CIPHERS: dict[int, Fernet] = {}
 
 # Private chats only; edits of old messages are ignored.
 PRIVATE = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
@@ -90,13 +108,17 @@ def local_minute(dt: datetime) -> datetime:
     return dt.astimezone(TZ).replace(tzinfo=None, second=0, microsecond=0)
 
 
-def store_for(uid: int) -> SpendingStorage:
-    return SpendingStorage(DATA_DIR / "users" / str(int(uid)))
+def user_dir(uid: int) -> Path:
+    return DATA_DIR / "users" / str(int(uid))
 
 
-def store_of(update: Update) -> SpendingStorage:
-    """The sender's own storage. Registers the sender on first contact."""
-    uid = update.effective_user.id
+def store_for(uid: int) -> SpendingStorage | None:
+    """The user's own storage, or None while they are locked (or have no vault yet)."""
+    cipher = CIPHERS.get(int(uid))
+    return SpendingStorage(user_dir(uid), cipher) if cipher else None
+
+
+def register(uid: int) -> None:
     current = now()
     if users.register(
         uid,
@@ -104,7 +126,15 @@ def store_of(update: Update) -> SpendingStorage:
         last_month=month_key(*due_month(current)),
     ):
         log.info("New user %s", uid)
-    return store_for(uid)
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> SpendingStorage | None:
+    """The sender's own unlocked storage, or None after asking for their password."""
+    register(update.effective_user.id)
+    store = store_for(update.effective_user.id)
+    if store is None:
+        await prompt_password(update, context)
+    return store
 
 
 def args_of(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -241,48 +271,54 @@ def due_month(current: datetime) -> tuple[int, int]:
     return prev_month(current.year, current.month)
 
 
-async def send_due_reports(bot: Bot) -> bool:
-    """Send each user the latest weekly/monthly report they have not received yet.
+async def send_user_reports(bot: Bot, uid: int) -> bool:
+    """Send one user the latest weekly/monthly report they have not received yet.
 
-    Returns True if a network problem means it should be retried later.
+    Locked users are skipped (their data cannot be read); they get the report
+    as soon as they unlock. Returns True if a network problem means "retry later".
     """
+    user = users.get(uid)
+    store = store_for(uid)
+    if user is None or store is None or not user.get("reports", True):
+        return False
     current = now()
     week_end = due_week_end(current)
     week = week_end.isoformat()
     ym = due_month(current)
     month = month_key(*ym)
-    retry = False
+    try:
+        if user.get("last_week", "") < week:
+            start = week_end - timedelta(days=6)
+            await send_period_report(
+                bot, uid, store, "Haftalik hisobot", start, week_end,
+                week_filename(start, week_end), show_days=True,
+            )
+            users.update(uid, last_week=week)
+        if user.get("last_month", "") < month:
+            start, end = month_bounds(*ym)
+            await send_period_report(
+                bot, uid, store, f"Oylik hisobot: {t.month_name(*ym)}", start, end,
+                month_filename(*ym), show_days=False,
+            )
+            users.update(uid, last_month=month)
+    except Forbidden:
+        # The user blocked the bot; don't keep trying.
+        log.info("User %s blocked the bot, skipping reports", uid)
+        users.update(uid, last_week=week, last_month=month)
+    except NetworkError:
+        log.warning("Network error sending report to %s, will retry", uid)
+        return True
+    except Exception:
+        log.exception("Report for user %s failed", uid)
+        users.update(uid, last_week=week, last_month=month)
+    return False
 
+
+async def send_due_reports(bot: Bot) -> bool:
+    """Send every unlocked user their due reports. True means "retry later"."""
+    retry = False
     for uid in users.ids():
-        user = users.get(uid)
-        if not user.get("reports", True):
-            continue
-        store = store_for(uid)
-        try:
-            if user.get("last_week", "") < week:
-                start = week_end - timedelta(days=6)
-                await send_period_report(
-                    bot, uid, store, "Haftalik hisobot", start, week_end,
-                    week_filename(start, week_end), show_days=True,
-                )
-                users.update(uid, last_week=week)
-            if user.get("last_month", "") < month:
-                start, end = month_bounds(*ym)
-                await send_period_report(
-                    bot, uid, store, f"Oylik hisobot: {t.month_name(*ym)}", start, end,
-                    month_filename(*ym), show_days=False,
-                )
-                users.update(uid, last_month=month)
-        except Forbidden:
-            # The user blocked the bot; don't keep trying.
-            log.info("User %s blocked the bot, skipping reports", uid)
-            users.update(uid, last_week=week, last_month=month)
-        except NetworkError:
-            log.warning("Network error sending report to %s, will retry", uid)
-            retry = True
-        except Exception:
-            log.exception("Report for user %s failed", uid)
-            users.update(uid, last_week=week, last_month=month)
+        retry |= await send_user_reports(bot, uid)
         await asyncio.sleep(0.1)  # stay well under Telegram's rate limits
     return retry
 
@@ -297,6 +333,167 @@ def schedule_reports(app: Application) -> None:
     # (Sunday for weekly, last day of month for monthly).
     app.job_queue.run_daily(report_job, time=WEEKLY_REPORT_AT.replace(tzinfo=TZ), name="weekly")
     app.job_queue.run_daily(report_job, time=MONTHLY_REPORT_AT.replace(tzinfo=TZ), name="monthly")
+    app.job_queue.run_daily(purge_job, time=PURGE_AT.replace(tzinfo=TZ), name="purge")
+
+
+# ---------- retention ----------
+
+def purge_expired() -> int:
+    """Delete month files older than RETENTION_MONTHS for every user (no keys needed)."""
+    current = today()
+    keep_from = shift_month(current.year, current.month, -RETENTION_MONTHS)
+    root = DATA_DIR / "users"
+    if not root.is_dir():
+        return 0
+    deleted = sum(purge_old(d, keep_from) for d in root.iterdir() if d.is_dir())
+    if deleted:
+        log.info("Deleted %d expired month files", deleted)
+    return deleted
+
+
+async def purge_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await asyncio.to_thread(purge_expired)
+
+
+# ---------- password flow ----------
+
+FLOW_KEYS = ("state", "pw1", "old_pw")
+
+
+def clear_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for key in FLOW_KEYS:
+        context.user_data.pop(key, None)
+
+
+async def say(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs) -> None:
+    # Not msg.reply_text: the user's message (a password) may already be deleted.
+    await context.bot.send_message(update.effective_chat.id, text, **kwargs)
+
+
+async def prompt_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask the sender to unlock (existing vault) or to set a password (new user)."""
+    uid = update.effective_user.id
+    if Vault(user_dir(uid)).exists():
+        context.user_data["state"] = "unlock"
+        text = t.LOCKED + (t.LOCKED_PENDING if context.user_data.get("pending") else "")
+    else:
+        context.user_data["state"] = "set1"
+        text = t.PASSWORD_INTRO
+    # The main keyboard is hidden so that a button tap is never mistaken for a password.
+    await say(update, context, text, reply_markup=ReplyKeyboardRemove())
+
+
+def password_problem(password: str) -> str | None:
+    if len(password) < MIN_PASSWORD:
+        return t.PASSWORD_TOO_SHORT
+    if len(password) > MAX_PASSWORD:
+        return t.PASSWORD_TOO_LONG
+    return None
+
+
+def register_failure(context: ContextTypes.DEFAULT_TYPE) -> str:
+    ud = context.user_data
+    ud["fails"] = ud.get("fails", 0) + 1
+    if ud["fails"] >= MAX_PASSWORD_FAILS:
+        ud["fails"] = 0
+        ud["locked_until"] = monotonic() + LOCKOUT_SECONDS
+        return t.TOO_MANY_ATTEMPTS.format(minutes=LOCKOUT_SECONDS // 60)
+    return t.WRONG_PASSWORD
+
+
+async def flush_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, store: SpendingStorage) -> None:
+    """Save the messages that arrived while the user was locked."""
+    saved = 0
+    for when, amount, reason, msg in context.user_data.pop("pending", []):
+        if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
+            break
+        store.append(when, amount, reason)
+        saved += 1
+        try:
+            await msg.set_reaction("👍")
+        except TelegramError:
+            pass
+    if saved:
+        await say(update, context, t.PENDING_SAVED.format(n=saved))
+
+
+async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE, password: str) -> None:
+    """One step of set / unlock / change-password. `password` is never logged or stored."""
+    msg = update.effective_message
+    ud = context.user_data
+    uid = update.effective_user.id
+    state = ud["state"]
+
+    deleted = True
+    try:
+        await msg.delete()
+    except TelegramError:
+        deleted = False
+    hint = "" if deleted else "\n\n" + t.PASSWORD_DELETE_HINT
+
+    if state in ("unlock", "chg_old") and ud.get("locked_until", 0) > monotonic():
+        minutes = max(1, round((ud["locked_until"] - monotonic()) / 60))
+        await say(update, context, t.TOO_MANY_ATTEMPTS.format(minutes=minutes))
+        return
+
+    vault = Vault(user_dir(uid))
+    if state == "unlock":
+        cipher = await asyncio.to_thread(vault.unlock, password)
+        if cipher is None:
+            await say(update, context, register_failure(context))
+            return
+        ud.pop("fails", None)
+        CIPHERS[uid] = cipher
+        ud.pop("state", None)
+        await say(update, context, t.UNLOCKED + hint, reply_markup=MAIN_KEYBOARD)
+        await flush_pending(update, context, store_for(uid))
+        await send_user_reports(context.bot, uid)  # reports that were due while locked
+
+    elif state in ("set1", "chg1"):
+        problem = password_problem(password)
+        if problem:
+            await say(update, context, problem)
+            return
+        ud["pw1"] = password
+        ud["state"] = "set2" if state == "set1" else "chg2"
+        await say(update, context, t.PASSWORD_AGAIN)
+
+    elif state == "set2":
+        first = ud.pop("pw1", None)
+        if password != first:
+            ud["state"] = "set1"
+            await say(update, context, t.PASSWORD_MISMATCH)
+            return
+        cipher = await asyncio.to_thread(vault.create, password)
+        CIPHERS[uid] = cipher
+        converted = encrypt_legacy(user_dir(uid), cipher)
+        ud.pop("state", None)
+        await say(
+            update, context,
+            t.PASSWORD_SET + ("\n" + t.LEGACY_ENCRYPTED if converted else "") + hint,
+            reply_markup=MAIN_KEYBOARD,
+        )
+        await flush_pending(update, context, store_for(uid))
+
+    elif state == "chg_old":
+        if await asyncio.to_thread(vault.unlock, password) is None:
+            await say(update, context, register_failure(context))
+            return
+        ud.pop("fails", None)
+        ud["old_pw"] = password
+        ud["state"] = "chg1"
+        await say(update, context, t.PASSWORD_CHANGE_ASK_NEW)
+
+    elif state == "chg2":
+        first, old = ud.pop("pw1", None), ud.pop("old_pw", None)
+        if password != first or old is None:
+            ud["state"] = "chg1"
+            await say(update, context, t.PASSWORD_MISMATCH)
+            return
+        ud.pop("state", None)
+        changed = await asyncio.to_thread(vault.change_password, old, password)
+        await say(update, context, (t.PASSWORD_CHANGED if changed else t.ERROR) + hint,
+                  reply_markup=MAIN_KEYBOARD)
 
 
 # ---------- messages ----------
@@ -304,12 +501,26 @@ def schedule_reports(app: Application) -> None:
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     text = msg.text.strip()
+    uid = update.effective_user.id
+    register(uid)
+
     if handler := BUTTONS.get(text):
+        clear_flow(context)  # a button tap always abandons a half-finished password step
         await handler(update, context)
         return
+    if context.user_data.get("state"):
+        await handle_password(update, context, msg.text)  # exact text: no stripping
+        return
 
-    store = store_of(update)
+    store = store_for(uid)
     parsed = parse_spending(text)
+    if store is None:
+        # Locked: keep the spending in memory only, and save it after unlocking.
+        pending = context.user_data.setdefault("pending", [])
+        if parsed and len(pending) < MAX_PENDING:
+            pending.append((local_minute(msg.date), *parsed, msg))
+        await prompt_password(update, context)
+        return
     if parsed is None:
         await msg.reply_text(t.NOT_UNDERSTOOD, reply_markup=MAIN_KEYBOARD)
         return
@@ -335,17 +546,25 @@ async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------- commands ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store_of(update)
-    await update.effective_message.reply_text(t.WELCOME, reply_markup=MAIN_KEYBOARD)
+    uid = update.effective_user.id
+    register(uid)
+    if store_for(uid):
+        await update.effective_message.reply_text(t.WELCOME, reply_markup=MAIN_KEYBOARD)
+        return
+    if not Vault(user_dir(uid)).exists():
+        await update.effective_message.reply_text(t.WELCOME, reply_markup=ReplyKeyboardRemove())
+    await prompt_password(update, context)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store_of(update)
+    register(update.effective_user.id)
     await update.effective_message.reply_text(t.HELP, reply_markup=MAIN_KEYBOARD)
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     day = today()
     entries = [e for e in numbered_month(store, day.year, day.month) if e[1] and e[1].date() == day]
     if not entries:
@@ -358,7 +577,9 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     end = today()
     start = end - timedelta(days=end.weekday())  # Monday
     if not await send_period_report(
@@ -369,7 +590,9 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     args = args_of(context)
     ym = parse_month(args[0]) if args else (today().year, today().month)
     if ym is None:
@@ -384,7 +607,9 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     args = args_of(context)
     ym = parse_month(args[0]) if args else (today().year, today().month)
     if ym is None:
@@ -402,7 +627,9 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     current = today()
     days = [current - timedelta(days=offset) for offset in range(6, -1, -1)]
     recent = store.entries_between(days[0], current)
@@ -431,7 +658,9 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     args = split_args(update, 1)
     rest = args[0] if args else ""
 
@@ -461,7 +690,9 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     args = split_args(update, 2)
     parsed = parse_spending(args[1]) if len(args) == 2 else None
     if not args or not args[0].isdigit() or parsed is None:
@@ -478,7 +709,9 @@ async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     args = args_of(context)
     if not args or not args[0].isdigit():
         await update.effective_message.reply_text(t.USAGE_DELETE)
@@ -495,7 +728,9 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ask for confirmation before deleting the most recent spending of this month."""
-    store = store_of(update)
+    store = await gate(update, context)
+    if store is None:
+        return
     current = today()
     entries = store.entries(current.year, current.month)
     if not entries:
@@ -517,29 +752,65 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    if query.data == "keep":
+    uid = query.from_user.id  # every action below acts on the tapping user's own data only
+    data = query.data or ""
+
+    if data == "keep":
         await query.edit_message_text(t.KEPT)
+    elif data == "wipe:no":
+        await query.edit_message_text(t.WIPE_CANCELLED)
+    elif data == "wipe:yes":
+        CIPHERS.pop(uid, None)
+        clear_flow(context)
+        context.user_data.pop("pending", None)
+        shutil.rmtree(user_dir(uid), ignore_errors=True)
+        await query.edit_message_text(t.WIPE_DONE)
+        await prompt_password(update, context)
+    elif m := re.fullmatch(r"del:(\d{4}):(\d{1,2}):(\d+)", data):
+        year, month, number = map(int, m.groups())
+        store = store_for(uid)
+        if store is None:  # the bot was restarted since the button was shown
+            await query.edit_message_text(t.LOCKED)
+            context.user_data["state"] = "unlock"
+            return
+        # Only delete if that entry is still the last one (nothing changed meanwhile).
+        if len(store.entries(year, month)) != number:
+            await query.edit_message_text(t.ALREADY_CHANGED)
+            return
+        removed = store.delete(year, month, number)
+        if removed is None:
+            await query.edit_message_text(t.ALREADY_CHANGED)
+            return
+        await query.edit_message_text(t.DELETED.format(entry=t.entry_short(removed[1], removed[2])))
+
+
+async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Change the password (needs the current one)."""
+    store = await gate(update, context)
+    if store is None:
         return
-    m = re.fullmatch(r"del:(\d{4}):(\d{1,2}):(\d+)", query.data or "")
-    if not m:
-        return
-    year, month, number = map(int, m.groups())
-    # Always the tapping user's own storage.
-    store = store_for(query.from_user.id)
-    # Only delete if that entry is still the last one (nothing changed meanwhile).
-    if len(store.entries(year, month)) != number:
-        await query.edit_message_text(t.ALREADY_CHANGED)
-        return
-    removed = store.delete(year, month, number)
-    if removed is None:
-        await query.edit_message_text(t.ALREADY_CHANGED)
-        return
-    await query.edit_message_text(t.DELETED.format(entry=t.entry_short(removed[1], removed[2])))
+    context.user_data["state"] = "chg_old"
+    await update.effective_message.reply_text(t.PASSWORD_CHANGE_ASK_OLD, reply_markup=ReplyKeyboardRemove())
+
+
+async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete all of the sender's data, also the way out when the password is forgotten."""
+    register(update.effective_user.id)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(t.BTN_WIPE_YES, callback_data="wipe:yes"),
+        InlineKeyboardButton(t.BTN_NO, callback_data="wipe:no"),
+    ]])
+    await update.effective_message.reply_text(t.WIPE_ASK, reply_markup=keyboard)
+
+
+async def clear_flow_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Any command abandons a half-finished password step (runs before the command itself)."""
+    clear_flow(context)
 
 
 async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store_of(update)
     uid = update.effective_user.id
+    register(uid)
     enabled = not users.get(uid).get("reports", True)
     fields = {"reports": enabled}
     if enabled:
@@ -580,11 +851,8 @@ async def post_init(app: Application) -> None:
     except TelegramError:
         log.warning("Could not set bot description")
     schedule_reports(app)
-    try:
-        await send_due_reports(app.bot)
-    except Exception:
-        log.exception("Catch-up of missed reports failed")
-    log.info("Spendwise started, %d users", len(users.ids()))
+    await asyncio.to_thread(purge_expired)
+    log.info("Spendwise started, %d users (all locked until they enter their password)", len(users.ids()))
 
 
 def main() -> None:
@@ -604,7 +872,10 @@ def main() -> None:
         "ochirish": cmd_delete,
         "bekor": cmd_undo,
         "hisobot": cmd_reports,
+        "parol": cmd_password,
+        "tozalash": cmd_wipe,
     }
+    app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, clear_flow_on_command), group=-1)
     for name, callback in handlers.items():
         app.add_handler(CommandHandler(name, callback, filters=PRIVATE))
     app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, on_unknown_command))
