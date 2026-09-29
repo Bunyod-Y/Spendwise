@@ -1,28 +1,41 @@
-"""Spendwise: private Telegram bot that saves every message as a spending.
+"""Spendwise: multi-user Telegram spending tracker with an Uzbek UI.
 
-"50000 lunch" → a row in this month's spreadsheet. At the end of each month
-the bot sends the month's file.
+Anyone can use the bot. Every user's spendings live in their own directory
+(data/users/<telegram_id>/), and every handler resolves that directory from
+the sender's own Telegram ID, so users can never see each other's data.
 """
 from __future__ import annotations
 
+import asyncio
+import calendar
 import logging
 import os
 import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
-from telegram import BotCommand, Bot, Update
+from telegram import (
+    Bot,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.error import Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 
-from settings import Settings
+import texts as t
 from storage import SpendingStorage
+from users import UserRegistry
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -31,81 +44,41 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("spendwise")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tashkent"))
 
-spendings = SpendingStorage(DATA_DIR)
-settings = Settings.load(
-    DATA_DIR / "settings.json", default_timezone=os.environ.get("TIMEZONE", "Asia/Tashkent")
-)
-
-REPORT_JOB = "monthly_report"
-MAX_CATCH_UP_MONTHS = 3
+WEEKLY_REPORT_AT = time(12, 0)   # every Sunday
+MONTHLY_REPORT_AT = time(21, 0)  # last day of every month
+MAX_ENTRIES_PER_MONTH = 3000     # per user; protects the server's disk
 TG_LIMIT = 4000
 
-# Only react to new messages from the owner; edits of old messages are ignored.
-OWNER = filters.User(user_id=OWNER_ID) & filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+users = UserRegistry(DATA_DIR / "users.json")
 
-# Amount: 50000 / 50 000 / 50,000 / 12.5 / 12,5 / 50k (k = thousand)
-AMOUNT = r"(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,](?P<frac>\d{1,2}))?(?P<mult>[kKкК])?"
+# Private chats only; edits of old messages are ignored.
+PRIVATE = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    t.KEYBOARD, resize_keyboard=True, is_persistent=True,
+    input_field_placeholder=t.INPUT_PLACEHOLDER,
+)
+
+# Amount: 50000 / 50 000 / 50,000 / 12.5 / 12,5 / 50k / 30 ming / 1.5 mln
+AMOUNT = (
+    r"(?P<num>\d{1,3}(?:[ ,]\d{3})+|\d+)(?:[.,](?P<frac>\d{1,2}))?"
+    r"(?:\s*(?P<mult>(?i:k|к|ming|mln|million|млн))(?![^\W\d_]))?"
+)
+MULTIPLIERS = {"k": 1e3, "к": 1e3, "ming": 1e3, "mln": 1e6, "million": 1e6, "млн": 1e6}
 SPEND_AMOUNT_FIRST = re.compile(rf"^{AMOUNT}(?:\s+(?P<reason>.*))?$", re.S)
 SPEND_AMOUNT_LAST = re.compile(rf"^(?P<reason>.*?)\s+{AMOUNT}$", re.S)
-FORMAT_HINT = 'Send it like "50000 lunch", "taxi 25 000" or "50k groceries".'
-
-COMMANDS = [
-    ("month", "This month's spreadsheet: /month 08.2026"),
-    ("list", "This month's spendings as text"),
-    ("today", "Today's spendings"),
-    ("stats", "Spending by day and month overview"),
-    ("add", "Add for another day: /add 25.09 50000 lunch"),
-    ("edit", "Edit spending: /edit 3 45000 lunch"),
-    ("delete", "Delete spending: /delete 3"),
-    ("undo", "Delete the last spending"),
-    ("settings", "Show current settings"),
-    ("settime", "Monthly report time: /settime 23:59"),
-    ("settz", "Timezone: /settz Asia/Tashkent"),
-    ("report", "Monthly report on/off: /report off"),
-    ("help", "Show help"),
-]
-
-HELP_TEXT = """\
-💰 Spendwise
-
-Send every spending as a message, and I save it to this month's spreadsheet:
-  50000 lunch
-  taxi 25 000
-  12.5 coffee
-  50k groceries  (k = thousand)
-
-On the last day of each month at {report_time} ({timezone}) I send you that month's file.
-
-Files and lists
-/month: this month's spreadsheet with TOTAL (/month 08.2026 for another month)
-/list: this month's spendings, numbered, with total (/list 08.2026)
-/today: today's spendings and total
-/stats: totals per day for the last week and a month overview
-
-Fixing entries (numbers come from /list)
-/add 25.09 50000 lunch: add a spending for another day (optional time: /add 25.09 14:30 50000 lunch)
-/edit 3 45000 lunch: change the amount and reason of spending 3
-/delete 3: delete spending 3
-/undo: delete the last spending
-
-Settings
-/settings: show the current settings
-/settime 23:59: change the monthly report time
-/settz Asia/Tashkent: change the timezone
-/report on|off: turn the automatic monthly report on or off"""
+CURRENCY = r"(?i:so['ʻ’`‘]?m|sum|сум|сўм)"
+CURRENCY_AT_END = re.compile(rf"(?:^|\s+){CURRENCY}[.!]?\s*$")
+CURRENCY_AT_START = re.compile(rf"^{CURRENCY}(?![^\W\d_])[\s,.:-]*")
 
 
 # ---------- helpers ----------
 
-def tz() -> ZoneInfo:
-    return ZoneInfo(settings.timezone)
-
-
 def now() -> datetime:
-    return datetime.now(tz())
+    return datetime.now(TZ)
 
 
 def today() -> date:
@@ -114,7 +87,33 @@ def today() -> date:
 
 def local_minute(dt: datetime) -> datetime:
     """Telegram UTC timestamp → naive local time, rounded down to the minute."""
-    return dt.astimezone(tz()).replace(tzinfo=None, second=0, microsecond=0)
+    return dt.astimezone(TZ).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def store_for(uid: int) -> SpendingStorage:
+    return SpendingStorage(DATA_DIR / "users" / str(int(uid)))
+
+
+def store_of(update: Update) -> SpendingStorage:
+    """The sender's own storage. Registers the sender on first contact."""
+    uid = update.effective_user.id
+    current = now()
+    if users.register(
+        uid,
+        last_week=due_week_end(current).isoformat(),
+        last_month=month_key(*due_month(current)),
+    ):
+        log.info("New user %s", uid)
+    return store_for(uid)
+
+
+def args_of(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
+    return context.args or []
+
+
+def split_args(update: Update, maxsplit: int) -> list[str]:
+    """Split the raw command text, keeping newlines/spacing in the final part."""
+    return (update.effective_message.text or "").split(maxsplit=maxsplit)[1:]
 
 
 def parse_date(text: str) -> date | None:
@@ -157,74 +156,40 @@ def parse_month(text: str) -> tuple[int, int] | None:
 
 
 def parse_spending(text: str) -> tuple[float, str] | None:
-    """'50000 lunch' / 'taxi 25 000' / '50k food' → (amount, reason)."""
-    text = text.strip()
+    """'50000 non' / 'taksi 25 000' / '30 ming tushlik' / '1.5 mln ijara' → (amount, reason)."""
+    text = CURRENCY_AT_END.sub("", text.strip())
     m = SPEND_AMOUNT_FIRST.match(text) or SPEND_AMOUNT_LAST.match(text)
     if not m:
         return None
     amount = float(re.sub(r"[ ,]", "", m["num"]) + "." + (m["frac"] or "0"))
     if m["mult"]:
-        amount *= 1000
-    if amount <= 0:
+        amount *= MULTIPLIERS[m["mult"].lower()]
+    amount = round(amount, 2)
+    if not 0 < amount < 1e13:
         return None
     if amount.is_integer():
         amount = int(amount)
-    return amount, (m["reason"] or "").strip()
+    reason = CURRENCY_AT_START.sub("", (m["reason"] or "").strip())
+    return amount, reason.strip(" -–—:,")
 
 
-def fmt_amount(amount: float) -> str:
-    text = f"{amount:,.0f}" if float(amount).is_integer() else f"{amount:,.2f}"
-    return text.replace(",", " ")
-
-
-def fmt_month(year: int, month: int) -> str:
-    return f"{month:02d}.{year}"
+def month_key(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
 
 
 def prev_month(year: int, month: int) -> tuple[int, int]:
     return (year - 1, 12) if month == 1 else (year, month - 1)
 
 
-def next_month(year: int, month: int) -> tuple[int, int]:
-    return (year + 1, 1) if month == 12 else (year, month + 1)
+def month_bounds(year: int, month: int) -> tuple[date, date]:
+    return date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1])
 
 
-def is_last_day_of_month(day: date) -> bool:
-    return (day + timedelta(days=1)).month != day.month
+def numbered_month(store: SpendingStorage, year: int, month: int):
+    return [(i, *entry) for i, entry in enumerate(store.entries(year, month), 1)]
 
 
-def split_args(update: Update, maxsplit: int) -> list[str]:
-    """Split the raw command text, keeping newlines/spacing in the final part."""
-    return (update.effective_message.text or "").split(maxsplit=maxsplit)[1:]
-
-
-def month_arg(context: ContextTypes.DEFAULT_TYPE) -> tuple[int, int] | None:
-    if not context.args:
-        current = today()
-        return current.year, current.month
-    return parse_month(context.args[0])
-
-
-def day_total(day: date) -> float:
-    return sum(
-        amount for when, amount, _ in spendings.entries(day.year, day.month)
-        if when is not None and when.date() == day
-    )
-
-
-def month_total(year: int, month: int) -> float:
-    return sum(amount for _, amount, _ in spendings.entries(year, month))
-
-
-def saved_text(number: int, when: datetime, amount: float, reason: str) -> str:
-    return (
-        f"💰 #{number} saved: {fmt_amount(amount)}, {reason or 'no reason'}\n"
-        f"{when:%d.%m}: {fmt_amount(day_total(when.date()))} · "
-        f"{fmt_month(when.year, when.month)}: {fmt_amount(month_total(when.year, when.month))}"
-    )
-
-
-async def reply_long(update: Update, text: str) -> None:
+async def reply_long(update: Update, text: str, **kwargs) -> None:
     chunk = ""
     for line in text.splitlines():
         if len(chunk) + len(line) + 1 > TG_LIMIT:
@@ -232,185 +197,241 @@ async def reply_long(update: Update, text: str) -> None:
             chunk = ""
         chunk += line + "\n"
     if chunk.strip():
-        await update.effective_message.reply_text(chunk)
+        await update.effective_message.reply_text(chunk, **kwargs)
 
 
-async def send_month_file(bot: Bot, year: int, month: int, caption_prefix: str = "") -> None:
-    data, count, total = spendings.export(year, month)
-    await bot.send_document(
-        chat_id=OWNER_ID,
-        document=data,
-        filename=f"spendings_{fmt_month(year, month)}.xlsx",
-        caption=f"{caption_prefix}{fmt_month(year, month)}: {count} spendings, total {fmt_amount(total)}",
-    )
+async def send_period_report(
+    bot: Bot, chat_id: int, store: SpendingStorage,
+    title: str, start: date, end: date, filename: str, show_days: bool,
+) -> bool:
+    """Send a summary message plus an Excel file. Returns False if the period is empty."""
+    entries = store.entries_between(start, end)
+    if not entries:
+        return False
+    await bot.send_message(chat_id, t.summary(title, start, end, today(), entries, show_days))
+    data, _, _ = store.export_range(start, end, "Xarajatlar")
+    await bot.send_document(chat_id, document=data, filename=filename)
+    return True
 
 
-# ---------- monthly report ----------
+def week_filename(start: date, end: date) -> str:
+    return f"xarajatlar_{start:%d.%m}-{end:%d.%m.%Y}.xlsx"
 
-def due_report_month(on_schedule: bool = False) -> tuple[int, int]:
-    """The most recent month whose report should already have been sent."""
-    current = now()
-    hour, minute = settings.report_hour_minute
-    if is_last_day_of_month(current.date()) and (on_schedule or current.time() >= time(hour, minute)):
+
+def month_filename(year: int, month: int) -> str:
+    return f"xarajatlar_{month:02d}.{year}.xlsx"
+
+
+# ---------- automatic reports ----------
+
+def due_week_end(current: datetime) -> date:
+    """Sunday of the latest week whose report time has passed."""
+    days_since_sunday = (current.weekday() + 1) % 7
+    sunday = current.date() - timedelta(days=days_since_sunday)
+    if days_since_sunday == 0 and current.time() < WEEKLY_REPORT_AT:
+        sunday -= timedelta(days=7)
+    return sunday
+
+
+def due_month(current: datetime) -> tuple[int, int]:
+    """The latest month whose report time has passed."""
+    last_day = calendar.monthrange(current.year, current.month)[1]
+    if current.day == last_day and current.time() >= MONTHLY_REPORT_AT:
         return current.year, current.month
     return prev_month(current.year, current.month)
 
 
-async def send_due_reports(bot: Bot, on_schedule: bool = False) -> None:
-    """Send every monthly report that is due but not sent yet (e.g. after downtime)."""
-    due = due_report_month(on_schedule)
-    if settings.last_report_month is None:
-        # First start: nothing is owed yet.
-        settings.last_report_month = f"{due[0]:04d}-{due[1]:02d}"
-        settings.save()
-        return
+async def send_due_reports(bot: Bot) -> bool:
+    """Send each user the latest weekly/monthly report they have not received yet.
 
-    year, month = map(int, settings.last_report_month.split("-"))
-    pending = []
-    ym = next_month(year, month)
-    while ym <= due:
-        pending.append(ym)
-        ym = next_month(*ym)
+    Returns True if a network problem means it should be retried later.
+    """
+    current = now()
+    week_end = due_week_end(current)
+    week = week_end.isoformat()
+    ym = due_month(current)
+    month = month_key(*ym)
+    retry = False
 
-    for ym in pending[-MAX_CATCH_UP_MONTHS:]:
-        prefix = "📊 Monthly spendings " if ym == due else "📊 Missed monthly spendings "
-        await send_month_file(bot, *ym, caption_prefix=prefix)
-        settings.last_report_month = f"{ym[0]:04d}-{ym[1]:02d}"
-        settings.save()
+    for uid in users.ids():
+        user = users.get(uid)
+        if not user.get("reports", True):
+            continue
+        store = store_for(uid)
+        try:
+            if user.get("last_week", "") < week:
+                start = week_end - timedelta(days=6)
+                await send_period_report(
+                    bot, uid, store, "Haftalik hisobot", start, week_end,
+                    week_filename(start, week_end), show_days=True,
+                )
+                users.update(uid, last_week=week)
+            if user.get("last_month", "") < month:
+                start, end = month_bounds(*ym)
+                await send_period_report(
+                    bot, uid, store, f"Oylik hisobot: {t.month_name(*ym)}", start, end,
+                    month_filename(*ym), show_days=False,
+                )
+                users.update(uid, last_month=month)
+        except Forbidden:
+            # The user blocked the bot; don't keep trying.
+            log.info("User %s blocked the bot, skipping reports", uid)
+            users.update(uid, last_week=week, last_month=month)
+        except NetworkError:
+            log.warning("Network error sending report to %s, will retry", uid)
+            retry = True
+        except Exception:
+            log.exception("Report for user %s failed", uid)
+            users.update(uid, last_week=week, last_month=month)
+        await asyncio.sleep(0.1)  # stay well under Telegram's rate limits
+    return retry
 
 
 async def report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Runs every day at the report time; only sends on the last day of the month.
-    try:
-        await send_due_reports(context.bot, on_schedule=True)
-    except Exception:
-        log.exception("Monthly report failed, retrying in 5 minutes")
-        context.job_queue.run_once(retry_job, when=300)
+    if await send_due_reports(context.bot):
+        context.job_queue.run_once(report_job, when=300)
 
 
-async def retry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        await send_due_reports(context.bot)
-    except Exception:
-        log.exception("Report retry failed, retrying in 5 minutes")
-        context.job_queue.run_once(retry_job, when=300)
-
-
-def schedule_report(app: Application) -> None:
-    for job in app.job_queue.get_jobs_by_name(REPORT_JOB):
-        job.schedule_removal()
-    if settings.report_enabled:
-        hour, minute = settings.report_hour_minute
-        app.job_queue.run_daily(
-            report_job, time=time(hour, minute, tzinfo=tz()), name=REPORT_JOB
-        )
-        log.info(
-            "Monthly report scheduled at %s %s on the last day of each month",
-            settings.report_time, settings.timezone,
-        )
+def schedule_reports(app: Application) -> None:
+    # Both jobs run daily; send_due_reports decides whether anything is due
+    # (Sunday for weekly, last day of month for monthly).
+    app.job_queue.run_daily(report_job, time=WEEKLY_REPORT_AT.replace(tzinfo=TZ), name="weekly")
+    app.job_queue.run_daily(report_job, time=MONTHLY_REPORT_AT.replace(tzinfo=TZ), name="monthly")
 
 
 # ---------- messages ----------
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    parsed = parse_spending(msg.text)
+    text = msg.text.strip()
+    if handler := BUTTONS.get(text):
+        await handler(update, context)
+        return
+
+    store = store_of(update)
+    parsed = parse_spending(text)
     if parsed is None:
-        await msg.reply_text(f"❗ No amount found. {FORMAT_HINT}")
+        await msg.reply_text(t.NOT_UNDERSTOOD, reply_markup=MAIN_KEYBOARD)
         return
     when = local_minute(msg.date)
-    number = spendings.append(when, *parsed)
-    await msg.reply_text(saved_text(number, when, *parsed))
+    if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
+        await msg.reply_text(t.LIMIT_REACHED)
+        return
+    store.append(when, *parsed)
+    try:
+        await msg.set_reaction("👍")
+    except TelegramError:
+        await msg.reply_text(t.SAVED_FALLBACK)
 
 
-async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat and update.effective_chat.type == "private":
-        await update.effective_message.reply_text(
-            f"This is a private bot. Your Telegram ID is {update.effective_user.id}."
-        )
+async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(t.ONLY_TEXT, reply_markup=MAIN_KEYBOARD)
+
+
+async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(t.UNKNOWN_COMMAND, reply_markup=MAIN_KEYBOARD)
 
 
 # ---------- commands ----------
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store_of(update)
+    await update.effective_message.reply_text(t.WELCOME, reply_markup=MAIN_KEYBOARD)
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        HELP_TEXT.format(report_time=settings.report_time, timezone=settings.timezone)
-    )
-
-
-async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ym = month_arg(context)
-    if ym is None:
-        await update.effective_message.reply_text("Usage: /month or /month 08.2026")
-        return
-    if ym != (today().year, today().month) and not spendings.exists(*ym):
-        await update.effective_message.reply_text(f"No spendings for {fmt_month(*ym)}.")
-        return
-    await send_month_file(context.bot, *ym)
-
-
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    ym = month_arg(context)
-    if ym is None:
-        await update.effective_message.reply_text("Usage: /list or /list 08.2026")
-        return
-    entries = spendings.entries(*ym)
-    if not entries:
-        await update.effective_message.reply_text(f"No spendings for {fmt_month(*ym)}.")
-        return
-    total = sum(a for _, a, _ in entries)
-    lines = [f"💰 {fmt_month(*ym)}: {len(entries)} spendings, total {fmt_amount(total)}", ""]
-    for i, (when, amount, reason) in enumerate(entries, 1):
-        stamp = when.strftime("%d.%m %H:%M") if when else "?"
-        lines.append(f"{i}. {stamp}  {fmt_amount(amount)}  {reason[:200]}")
-    await reply_long(update, "\n".join(lines))
+    store_of(update)
+    await update.effective_message.reply_text(t.HELP, reply_markup=MAIN_KEYBOARD)
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    current = today()
-    entries = [
-        (i, when, amount, reason)
-        for i, (when, amount, reason) in enumerate(spendings.entries(current.year, current.month), 1)
-        if when is not None and when.date() == current
-    ]
+    store = store_of(update)
+    day = today()
+    entries = [e for e in numbered_month(store, day.year, day.month) if e[1] and e[1].date() == day]
     if not entries:
-        await update.effective_message.reply_text("No spendings today.")
+        await update.effective_message.reply_text(t.NO_TODAY)
         return
     total = sum(e[2] for e in entries)
-    lines = [f"💰 Today ({current:%d.%m}): {fmt_amount(total)}", ""]
-    for i, when, amount, reason in entries:
-        lines.append(f"{i}. {when:%H:%M}  {fmt_amount(amount)}  {reason[:200]}")
+    lines = [f"📅 Bugun ({day:%d.%m}): {t.money(total)}", ""]
+    lines += [t.entry_line(n, when, amount, reason, with_date=False) for n, when, amount, reason in entries]
+    await reply_long(update, "\n".join(lines))
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = store_of(update)
+    end = today()
+    start = end - timedelta(days=end.weekday())  # Monday
+    if not await send_period_report(
+        context.bot, update.effective_chat.id, store, "Bu hafta", start, end,
+        week_filename(start, end), show_days=True,
+    ):
+        await update.effective_message.reply_text(t.NO_PERIOD)
+
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = store_of(update)
+    args = args_of(context)
+    ym = parse_month(args[0]) if args else (today().year, today().month)
+    if ym is None:
+        await update.effective_message.reply_text(t.USAGE_MONTH)
+        return
+    start, end = month_bounds(*ym)
+    if not await send_period_report(
+        context.bot, update.effective_chat.id, store, f"Oylik hisobot: {t.month_name(*ym)}",
+        start, end, month_filename(*ym), show_days=False,
+    ):
+        await update.effective_message.reply_text(t.NO_PERIOD)
+
+
+async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = store_of(update)
+    args = args_of(context)
+    ym = parse_month(args[0]) if args else (today().year, today().month)
+    if ym is None:
+        await update.effective_message.reply_text(t.USAGE_MONTH)
+        return
+    entries = numbered_month(store, *ym)
+    if not entries:
+        await update.effective_message.reply_text(t.NO_PERIOD)
+        return
+    total = sum(e[2] for e in entries)
+    lines = [f"📋 {t.month_name(*ym)}: {len(entries)} ta, jami {t.money(total)}", ""]
+    lines += [t.entry_line(*e) for e in entries]
+    lines += ["", "✏️ /tahrir 3 45000 non   🗑 /ochirish 3"]
     await reply_long(update, "\n".join(lines))
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = store_of(update)
     current = today()
     days = [current - timedelta(days=offset) for offset in range(6, -1, -1)]
-    totals = [day_total(d) for d in days]
+    recent = store.entries_between(days[0], current)
+    totals = [sum(a for w, a, _ in recent if w.date() == d) for d in days]
     peak = max(totals) or 1
-    lines = ["📈 Last 7 days", ""]
+    lines = ["📈 Oxirgi 7 kun", ""]
     for day, total in zip(days, totals):
-        bar = "█" * round(total / peak * 12)
-        lines.append(f"{day:%a %d.%m}  {fmt_amount(total):>12}  {bar}")
+        lines.append(f"{t.weekday(day)} {day:%d.%m}  {t.num(total):>11}  {'▇' * round(total / peak * 10)}")
 
-    entries = spendings.entries(current.year, current.month)
-    total = sum(a for _, a, _ in entries)
-    lines += ["", f"This month ({fmt_month(current.year, current.month)})"]
-    lines.append(f"Total: {fmt_amount(total)} in {len(entries)} spendings")
-    lines.append(f"Average per day: {fmt_amount(round(total / current.day))}")
-    if entries:
-        when, amount, reason = max(entries, key=lambda e: e[1])
-        stamp = f" ({when:%d.%m})" if when else ""
-        lines.append(f"Biggest: {fmt_amount(amount)}, {reason or 'no reason'}{stamp}")
-
+    month_entries = store.entries(current.year, current.month)
+    month_total = sum(a for _, a, _ in month_entries)
+    lines += [
+        "",
+        f"🗓 {t.month_name(current.year, current.month)}",
+        f"💰 Jami: {t.money(month_total)} ({len(month_entries)} ta)",
+        f"📉 Kunlik o'rtacha: {t.money(round(month_total / current.day))}",
+    ]
+    if month_entries:
+        when, amount, reason = max(month_entries, key=lambda e: e[1])
+        lines.append(f"🔝 Eng katta: {t.entry_short(amount, reason)} ({when:%d.%m})")
     prev = prev_month(current.year, current.month)
-    if spendings.exists(*prev):
-        lines.append(f"Last month ({fmt_month(*prev)}): {fmt_amount(month_total(*prev))}")
+    if store.exists(*prev):
+        prev_total = sum(a for _, a, _ in store.entries(*prev))
+        lines.append(f"⏮ {t.month_name(*prev)}: {t.money(prev_total)}")
     await update.effective_message.reply_text("\n".join(lines))
 
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    usage = "Usage: /add 25.09 50000 lunch  or  /add 25.09 14:30 50000 lunch"
+    store = store_of(update)
     args = split_args(update, 1)
     rest = args[0] if args else ""
 
@@ -422,171 +443,177 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hm = parse_hhmm(token)
     if hm is not None:
         rest = tail.strip()
-    if day is None and hm is None:
-        await update.effective_message.reply_text(usage)
-        return
-
-    parsed = parse_spending(rest)
+    parsed = parse_spending(rest) if (day or hm) else None
     if parsed is None:
-        await update.effective_message.reply_text(usage)
+        await update.effective_message.reply_text(t.USAGE_ADD)
         return
     when = datetime.combine(day or today(), time(*(hm or (12, 0))))
-    number = spendings.insert_sorted(when, *parsed)
-    await update.effective_message.reply_text(saved_text(number, when, *parsed))
+    if when.date() > today():
+        await update.effective_message.reply_text(t.FUTURE_DATE)
+        return
+    if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
+        await update.effective_message.reply_text(t.LIMIT_REACHED)
+        return
+    number = store.insert_sorted(when, *parsed)
+    await update.effective_message.reply_text(
+        t.ADDED.format(entry=t.entry_line(number, when, *parsed))
+    )
 
 
 async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = store_of(update)
     args = split_args(update, 2)
     parsed = parse_spending(args[1]) if len(args) == 2 else None
     if not args or not args[0].isdigit() or parsed is None:
-        await update.effective_message.reply_text("Usage: /edit 3 45000 lunch  (numbers from /list)")
+        await update.effective_message.reply_text(t.USAGE_EDIT)
         return
     current = today()
-    old = spendings.update(current.year, current.month, int(args[0]), *parsed)
+    old = store.update(current.year, current.month, int(args[0]), *parsed)
     if old is None:
-        await update.effective_message.reply_text(f"Spending {args[0]} not found this month.")
+        await update.effective_message.reply_text(t.NOT_FOUND.format(n=args[0]))
         return
     await update.effective_message.reply_text(
-        f"✓ Spending {args[0]} updated: {fmt_amount(parsed[0])}, {parsed[1] or 'no reason'}\n"
-        f"Was: {fmt_amount(old[1])}, {old[2] or 'no reason'}"
+        t.EDITED.format(entry=t.entry_short(*parsed), old=t.entry_short(old[1], old[2]))
     )
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args or not context.args[0].isdigit():
-        await update.effective_message.reply_text("Usage: /delete 3  (numbers from /list)")
+    store = store_of(update)
+    args = args_of(context)
+    if not args or not args[0].isdigit():
+        await update.effective_message.reply_text(t.USAGE_DELETE)
         return
     current = today()
-    removed = spendings.delete(current.year, current.month, int(context.args[0]))
+    removed = store.delete(current.year, current.month, int(args[0]))
     if removed is None:
-        await update.effective_message.reply_text(f"Spending {context.args[0]} not found this month.")
+        await update.effective_message.reply_text(t.NOT_FOUND.format(n=args[0]))
         return
     await update.effective_message.reply_text(
-        f"🗑 Deleted: {fmt_amount(removed[1])}, {removed[2] or 'no reason'}"
+        t.DELETED.format(entry=t.entry_short(removed[1], removed[2]))
     )
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation before deleting the most recent spending of this month."""
+    store = store_of(update)
     current = today()
-    removed = spendings.delete(current.year, current.month)
+    entries = store.entries(current.year, current.month)
+    if not entries:
+        await update.effective_message.reply_text(t.NOTHING_TO_UNDO)
+        return
+    number = len(entries)
+    when, amount, reason = entries[-1]
+    token = f"{current.year}:{current.month}:{number}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(t.BTN_YES_DELETE, callback_data=f"del:{token}"),
+        InlineKeyboardButton(t.BTN_NO, callback_data="keep"),
+    ]])
+    await update.effective_message.reply_text(
+        t.UNDO_CONFIRM.format(entry=t.entry_line(None, when, amount, reason)),
+        reply_markup=keyboard,
+    )
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "keep":
+        await query.edit_message_text(t.KEPT)
+        return
+    m = re.fullmatch(r"del:(\d{4}):(\d{1,2}):(\d+)", query.data or "")
+    if not m:
+        return
+    year, month, number = map(int, m.groups())
+    # Always the tapping user's own storage.
+    store = store_for(query.from_user.id)
+    # Only delete if that entry is still the last one (nothing changed meanwhile).
+    if len(store.entries(year, month)) != number:
+        await query.edit_message_text(t.ALREADY_CHANGED)
+        return
+    removed = store.delete(year, month, number)
     if removed is None:
-        await update.effective_message.reply_text("Nothing to undo this month.")
+        await query.edit_message_text(t.ALREADY_CHANGED)
         return
-    await update.effective_message.reply_text(
-        f"↩️ Removed: {fmt_amount(removed[1])}, {removed[2] or 'no reason'}"
-    )
+    await query.edit_message_text(t.DELETED.format(entry=t.entry_short(removed[1], removed[2])))
 
 
-async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(
-        "⚙️ Settings\n"
-        f"Timezone: {settings.timezone}\n"
-        f"Monthly report: {'on' if settings.report_enabled else 'off'}, "
-        f"last day of month at {settings.report_time}\n"
-        f"Last report sent for: {settings.last_report_month or 'none yet'}\n"
-        f"Now: {now():%d.%m.%Y %H:%M}"
-    )
+async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store_of(update)
+    uid = update.effective_user.id
+    enabled = not users.get(uid).get("reports", True)
+    fields = {"reports": enabled}
+    if enabled:
+        # Don't send reports for the period while they were switched off.
+        current = now()
+        fields.update(last_week=due_week_end(current).isoformat(), last_month=month_key(*due_month(current)))
+    users.update(uid, **fields)
+    await update.effective_message.reply_text(t.REPORTS_ON if enabled else t.REPORTS_OFF)
 
 
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    hm = parse_hhmm(context.args[0]) if context.args else None
-    if hm is None:
-        await update.effective_message.reply_text("Usage: /settime 23:59")
-        return
-    settings.report_time = f"{hm[0]:02d}:{hm[1]:02d}"
-    settings.save()
-    schedule_report(context.application)
-    await update.effective_message.reply_text(
-        f"✓ Monthly report time set to {settings.report_time} ({settings.timezone})."
-    )
-
-
-async def cmd_settz(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.effective_message.reply_text("Usage: /settz Asia/Tashkent")
-        return
-    try:
-        ZoneInfo(context.args[0])
-    except (ZoneInfoNotFoundError, ValueError):
-        await update.effective_message.reply_text(
-            f"Unknown timezone '{context.args[0]}'. Example: Asia/Tashkent, Europe/Berlin."
-        )
-        return
-    settings.timezone = context.args[0]
-    settings.save()
-    schedule_report(context.application)
-    await update.effective_message.reply_text(
-        f"✓ Timezone set to {settings.timezone}. Local time now: {now():%d.%m.%Y %H:%M}"
-    )
-
-
-async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    arg = context.args[0].lower() if context.args else ""
-    if arg not in ("on", "off"):
-        await update.effective_message.reply_text("Usage: /report on  or  /report off")
-        return
-    settings.report_enabled = arg == "on"
-    if settings.report_enabled:
-        # Don't flood with backlog from the time the report was off.
-        due = due_report_month()
-        settings.last_report_month = f"{due[0]:04d}-{due[1]:02d}"
-    settings.save()
-    schedule_report(context.application)
-    await update.effective_message.reply_text(
-        f"✓ Monthly report {'enabled at ' + settings.report_time if settings.report_enabled else 'disabled'}."
-    )
+BUTTONS = {
+    t.BTN_TODAY: cmd_today,
+    t.BTN_WEEK: cmd_week,
+    t.BTN_MONTH: cmd_month,
+    t.BTN_LIST: cmd_list,
+    t.BTN_STATS: cmd_stats,
+    t.BTN_UNDO: cmd_undo,
+    t.BTN_HELP: cmd_help,
+}
 
 
 # ---------- app wiring ----------
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.exception("Error while handling update", exc_info=context.error)
+    log.error("Error while handling update", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text(f"⚠️ Error: {context.error}")
-        except Exception:
+            await update.effective_message.reply_text(t.ERROR)
+        except TelegramError:
             pass
 
 
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([BotCommand(c, d) for c, d in COMMANDS])
-    schedule_report(app)
-    if settings.report_enabled:
-        try:
-            await send_due_reports(app.bot)
-        except Exception:
-            log.exception("Catch-up of missed reports failed")
-    log.info("Spendwise started for owner %s", OWNER_ID)
+    await app.bot.set_my_commands([BotCommand(c, d) for c, d in t.COMMANDS])
+    try:
+        await app.bot.set_my_description(t.BOT_DESCRIPTION)
+        await app.bot.set_my_short_description(t.BOT_SHORT_DESCRIPTION)
+    except TelegramError:
+        log.warning("Could not set bot description")
+    schedule_reports(app)
+    try:
+        await send_due_reports(app.bot)
+    except Exception:
+        log.exception("Catch-up of missed reports failed")
+    log.info("Spendwise started, %d users", len(users.ids()))
 
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     handlers = {
-        "start": cmd_help,
+        "start": cmd_start,
+        "yordam": cmd_help,
         "help": cmd_help,
-        "month": cmd_month,
-        "list": cmd_list,
-        "today": cmd_today,
-        "stats": cmd_stats,
-        "add": cmd_add,
-        "edit": cmd_edit,
-        "delete": cmd_delete,
-        "undo": cmd_undo,
-        "settings": cmd_settings,
-        "settime": cmd_settime,
-        "settz": cmd_settz,
-        "report": cmd_report,
+        "bugun": cmd_today,
+        "hafta": cmd_week,
+        "oy": cmd_month,
+        "royxat": cmd_list,
+        "statistika": cmd_stats,
+        "qoshish": cmd_add,
+        "tahrir": cmd_edit,
+        "ochirish": cmd_delete,
+        "bekor": cmd_undo,
+        "hisobot": cmd_reports,
     }
     for name, callback in handlers.items():
-        app.add_handler(CommandHandler(name, callback, filters=OWNER))
-    app.add_handler(MessageHandler(OWNER & filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_handler(
-        MessageHandler(~filters.User(user_id=OWNER_ID) & filters.UpdateType.MESSAGE, on_stranger)
-    )
+        app.add_handler(CommandHandler(name, callback, filters=PRIVATE))
+    app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, on_unknown_command))
+    app.add_handler(MessageHandler(PRIVATE & filters.TEXT, on_text))
+    app.add_handler(MessageHandler(PRIVATE & ~filters.TEXT, on_other))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(on_error)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY])
 
 
 if __name__ == "__main__":

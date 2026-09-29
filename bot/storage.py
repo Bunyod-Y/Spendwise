@@ -1,20 +1,26 @@
-"""Excel storage: one .xlsx per month (Date | Time | Amount | Reason).
+"""Excel storage for ONE user: one .xlsx per month (Sana | Vaqt | Summa | Izoh).
 
-Callers work with a single `datetime`; it is split into the Date and Time
+Every user gets their own SpendingStorage pointing at their own directory,
+so one user's data is never read or written through another user's instance.
+
+Callers work with a single `datetime`; it is split into the date and time
 columns on write and combined again on read.
 """
 from __future__ import annotations
 
 import io
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Iterator
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
-HEADERS = ("Date", "Time", "Amount", "Reason")
+HEADERS = ("Sana", "Vaqt", "Summa", "Izoh")
 WIDTHS = (12, 8, 16, 80)
+DAY_HEADERS = ("Sana", "Jami")
+DAY_WIDTHS = (12, 16)
 DATE_FORMAT = "DD.MM.YYYY"
 TIME_FORMAT = "HH:MM"
 TOP = Alignment(vertical="top")
@@ -25,6 +31,13 @@ Spending = tuple[datetime, float, str]
 
 def amount_format(amount: float) -> str:
     return "#,##0" if float(amount).is_integer() else "#,##0.00"
+
+
+def iter_months(start: date, end: date) -> Iterator[tuple[int, int]]:
+    year, month = start.year, start.month
+    while (year, month) <= (end.year, end.month):
+        yield year, month
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
 
 def _setup_sheet(ws: Worksheet, title: str, headers: tuple[str, ...], widths: tuple[int, ...]) -> None:
@@ -39,7 +52,7 @@ def _setup_sheet(ws: Worksheet, title: str, headers: tuple[str, ...], widths: tu
 
 
 def _read_when(day_value, time_value) -> datetime | None:
-    """Combine Date and Time cell values back into one datetime."""
+    """Combine date and time cell values back into one datetime."""
     if isinstance(day_value, datetime):
         day_value = day_value.date()
     if not isinstance(day_value, date):
@@ -91,9 +104,8 @@ def _save(wb: Workbook, path: Path) -> None:
 
 
 class SpendingStorage:
-    def __init__(self, data_dir: Path):
-        self.dir = data_dir / "spendings"
-        self.dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, user_dir: Path):
+        self.dir = user_dir
 
     def path_for(self, year: int, month: int) -> Path:
         return self.dir / f"{year:04d}-{month:02d}.xlsx"
@@ -101,19 +113,10 @@ class SpendingStorage:
     def exists(self, year: int, month: int) -> bool:
         return self.path_for(year, month).exists()
 
-    def months(self) -> list[tuple[int, int]]:
-        result = []
-        for p in self.dir.glob("*.xlsx"):
-            try:
-                year, month = p.stem.split("-")
-                result.append((int(year), int(month)))
-            except ValueError:
-                continue
-        return sorted(result)
-
     def ensure(self, year: int, month: int) -> Path:
         path = self.path_for(year, month)
         if not path.exists():
+            self.dir.mkdir(parents=True, exist_ok=True)
             wb = Workbook()
             _setup_sheet(wb.active, f"{month:02d}.{year}", HEADERS, WIDTHS)
             _save(wb, path)
@@ -134,6 +137,15 @@ class SpendingStorage:
             ]
         finally:
             wb.close()
+
+    def entries_between(self, start: date, end: date) -> list[Spending]:
+        """All spendings with start <= date <= end, in file order."""
+        return [
+            entry
+            for year, month in iter_months(start, end)
+            for entry in self.entries(year, month)
+            if entry[0] is not None and start <= entry[0].date() <= end
+        ]
 
     def append(self, when: datetime, amount: float, reason: str) -> int:
         """Add a spending at the end of its month's file. Returns its number (1-based)."""
@@ -177,48 +189,55 @@ class SpendingStorage:
         _save(wb, path)
         return old
 
-    def delete(self, year: int, month: int, number: int | None = None) -> Spending | None:
-        """Delete spending `number` (or the last one). Returns it, or None if missing."""
+    def get(self, year: int, month: int, number: int) -> Spending | None:
+        entries = self.entries(year, month)
+        return entries[number - 1] if 1 <= number <= len(entries) else None
+
+    def delete(self, year: int, month: int, number: int) -> Spending | None:
+        """Delete spending `number`. Returns it, or None if missing."""
         path = self.path_for(year, month)
         if not path.exists():
             return None
         wb = load_workbook(path)
         ws = wb.active
-        row = ws.max_row if number is None else number + 1
-        if row < 2 or row > ws.max_row:
+        row = number + 1
+        if number < 1 or row > ws.max_row:
             return None
         removed = _read_row(ws, row)
         ws.delete_rows(row)
         _save(wb, path)
         return removed
 
-    def export(self, year: int, month: int) -> tuple[bytes, int, float]:
-        """The month's file with a TOTAL row and a per-day Summary sheet.
+    def export_range(self, start: date, end: date, title: str) -> tuple[bytes, int, float]:
+        """A workbook with all spendings in [start, end], a JAMI row and per-day totals.
 
         Returns (xlsx bytes, count, total).
         """
-        wb = load_workbook(self.ensure(year, month))
+        rows = self.entries_between(start, end)
+        wb = Workbook()
         ws = wb.active
-        last = ws.max_row
-        rows = [_read_row(ws, r) for r in range(2, last + 1)]
+        _setup_sheet(ws, title, HEADERS, WIDTHS)
+        for when, amount, reason in rows:
+            _write_row(ws, ws.max_row + 1, when, amount, reason)
         total = sum(amount for _, amount, _ in rows)
-
-        label = ws.cell(row=last + 2, column=1, value="TOTAL")
+        label = ws.cell(row=ws.max_row + 2, column=1, value="JAMI")
         label.font = Font(bold=True)
-        total_cell = ws.cell(row=last + 2, column=3, value=total)
+        total_cell = ws.cell(row=label.row, column=3, value=total)
         total_cell.font = Font(bold=True)
         total_cell.number_format = amount_format(total)
 
         per_day: dict[date, float] = {}
         for when, amount, _ in rows:
-            if when is not None:
-                per_day[when.date()] = per_day.get(when.date(), 0) + amount
-        summary = wb.create_sheet("Summary")
-        _setup_sheet(summary, "Summary", ("Date", "Total"), (12, 16))
-        for day in sorted(per_day):
-            summary.append((day, per_day[day]))
-            summary.cell(row=summary.max_row, column=1).number_format = DATE_FORMAT
-            summary.cell(row=summary.max_row, column=2).number_format = amount_format(per_day[day])
+            per_day[when.date()] = per_day.get(when.date(), 0) + amount
+        days = wb.create_sheet()
+        _setup_sheet(days, "Kunlik jami", DAY_HEADERS, DAY_WIDTHS)
+        day = start
+        while day <= end:
+            if day in per_day:
+                days.append((day, per_day[day]))
+                days.cell(row=days.max_row, column=1).number_format = DATE_FORMAT
+                days.cell(row=days.max_row, column=2).number_format = amount_format(per_day[day])
+            day += timedelta(days=1)
 
         buf = io.BytesIO()
         wb.save(buf)

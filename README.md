@@ -1,81 +1,84 @@
-# Spendwise
+# Spendwise 💰
 
-A private Telegram bot for tracking spending. Send each spending as a message and the bot saves it to this month's Excel file:
+Xarajatlarni hisoblab boruvchi Telegram bot. Interfeysi to'liq o'zbek tilida va istalgan odam foydalana oladi. Har bir foydalanuvchining ma'lumotlari alohida saqlanadi va boshqalarga ko'rinmaydi.
 
-| Date       | Time  | Amount | Reason |
-|------------|-------|--------|--------|
-| 28.09.2026 | 13:05 | 50 000 | lunch  |
+## Foydalanish
 
-The amount can come first or last: `50000 lunch`, `taxi 25 000`, `1,250,000 rent`, `12.5 coffee`, `50k groceries` (`k` means ×1000). Each saved spending is confirmed with the day's and the month's running totals.
+Xarajatni oddiy xabar qilib yozing. Bot uni saqlaydi va xabaringizga 👍 qo'yadi:
 
-On the **last day of each month at 23:59 (Asia/Tashkent)**, the bot sends that month's file. The file has a TOTAL row and a *Summary* sheet with the total for each day. Only your Telegram account (`OWNER_ID`) can use the bot. Anyone else only gets a "private bot" reply.
+```
+50000 non
+non 50000
+taksi 25 000 so'm
+30 ming tushlik
+1.5 mln ijara
+50k benzin
+```
 
-## Commands
+Pastda doimiy tugmalar turadi:
 
-| Command | What it does |
+| Tugma | Nima qiladi |
 |---|---|
-| `/month` | This month's spreadsheet (`/month 08.2026` for another month) |
-| `/list` | This month's spendings, numbered, with total (`/list 08.2026`) |
-| `/today` | Today's spendings and total |
-| `/stats` | Totals per day for the last 7 days, month total, daily average, biggest spending, last month's total |
-| `/add 25.09 50000 lunch` | Add a spending for another day. Time is optional (`/add 25.09 14:30 50000 lunch`); without it, 12:00 is used |
-| `/edit 3 45000 lunch` | Change the amount and reason of spending #3 this month |
-| `/delete 3` | Delete spending #3 this month |
-| `/undo` | Delete the last spending |
-| `/settings` | Show the current settings |
-| `/settime 23:59` | Change the monthly report time |
-| `/settz Asia/Tashkent` | Change the timezone |
-| `/report on` / `/report off` | Turn the automatic monthly report on or off |
-| `/help` | Show help |
+| 📅 Bugun | Bugungi xarajatlar |
+| 📆 Bu hafta | Haftalik hisobot + Excel fayl |
+| 🗓 Bu oy | Oylik hisobot + Excel fayl |
+| 📋 Ro'yxat | Shu oydagi barcha xarajatlar, raqamlari bilan |
+| 📈 Statistika | Oxirgi 7 kun, oy jami, kunlik o'rtacha, eng katta xarajat |
+| ↩️ Oxirgisini o'chirish | Oxirgi yozuvni tasdiqlab o'chirish |
+| ❓ Yordam | Yordam |
 
-Spending numbers for `/edit` and `/delete` come from `/list`.
+Qo'shimcha buyruqlar:
 
-## Setup
+| Buyruq | Nima qiladi |
+|---|---|
+| `/tahrir 3 45000 non` | 3-xarajatni o'zgartirish (raqam «Ro'yxat»dan olinadi) |
+| `/ochirish 3` | 3-xarajatni o'chirish |
+| `/qoshish 25.09 50000 non` | Boshqa kunga qo'shish (vaqti bilan: `/qoshish 25.09 14:30 50000 non`) |
+| `/oy 08.2026` | Boshqa oy hisoboti |
+| `/hisobot` | Avtomatik hisobotlarni yoqish/o'chirish |
 
-### 1. Create the bot
-In Telegram, open **@BotFather**, send `/newbot`, and copy the token. Use a **new** bot: each running bot needs its own token.
+### Avtomatik hisobotlar (Toshkent vaqti)
+- **Haftalik:** har yakshanba soat 12:00 da (dushanba–yakshanba).
+- **Oylik:** oyning oxirgi kuni soat 21:00 da.
 
-### 2. Deploy on the server
-Docker must already be installed. This repo is public, so it can be cloned over HTTPS without a key:
+Hisobotda jami summa, xarajatlar soni, kunlik o'rtacha va eng ko'p sarflangan yo'nalishlar bo'ladi. Unga Excel fayl ham qo'shiladi (`Sana | Vaqt | Summa | Izoh`, JAMI qatori va «Kunlik jami» varag'i). Xarajat yozilmagan davr uchun hisobot yuborilmaydi. Botga yangi qo'shilgan foydalanuvchiga u qo'shilishidan oldingi davr uchun hisobot kelmaydi.
+
+## Maxfiylik
+
+- Har bir foydalanuvchining xarajatlari alohida papkada turadi: `data/users/<telegram_id>/`. Bot har bir so'rovda faqat yozgan odamning o'z papkasini ochadi. Boshqa foydalanuvchi ID'sini qabul qiladigan buyruq yo'q.
+- `users.json` faqat Telegram ID va hisobot holatini saqlaydi. Ism, username yoki telefon raqami saqlanmaydi.
+- Bot faqat shaxsiy chatlarda ishlaydi. Guruhga qo'shilsa, xabarlarga javob bermaydi.
+- Xabar matnlari logga yozilmaydi.
+- Fayllar serverda shifrlanmagan holda turadi, ya'ni server egasi ularni ko'ra oladi. Foydalanuvchilarga shuni aytib qo'ying.
+
+## O'rnatish (Ubuntu + Docker)
+
+1. @BotFather'da `/newbot` orqali bot yarating va tokenni oling.
+2. Serverda:
+   ```bash
+   git clone https://github.com/Bunyod-Y/Spendwise.git /opt/spendwise
+   cd /opt/spendwise
+   cp .env.example .env
+   nano .env          # BOT_TOKEN ni kiriting
+   chmod 600 .env
+   docker compose up -d --build
+   docker compose logs -f     # "Spendwise started" chiqishi kerak
+   ```
+
+Token faqat serverdagi `.env` faylida turadi. `.env` `.gitignore`da, shuning uchun hech qachon gitga tushmaydi.
+
+## Boshqarish
+
 ```bash
-ssh root@YOUR_SERVER_IP
-git clone https://github.com/Bunyod-Y/Spendwise.git /opt/spendwise
-cd /opt/spendwise
-cp .env.example .env
-nano .env            # set BOT_TOKEN and OWNER_ID
-chmod 600 .env
-docker compose up -d --build
-docker compose logs -f   # should show "Spendwise started for owner ..."
-```
-Send `/start` to the bot in Telegram.
-
-If you don't know your Telegram ID, set `OWNER_ID=1` first. Message the bot; it replies with your ID. Put that in `.env` and run `docker compose up -d`.
-
-This bot can run on the same server as other bots. It uses its own container (`spendwise`) and its own data volume (`spendwise-data`).
-
-## Operations
-
-Run these inside `/opt/spendwise`:
-
-```bash
-git pull && docker compose up -d --build   # deploy new code
-docker compose logs -f --tail 100          # view logs
-docker compose restart                     # restart
-docker compose down                        # stop (data is kept; never add -v, it deletes the data)
-docker cp spendwise:/data ./backup-$(date +%F)   # back up all spending files
+git pull && docker compose up -d --build      # yangi versiyani o'rnatish
+docker compose logs -f --tail 100             # loglar
+docker compose restart                        # qayta ishga tushirish
+docker compose down                           # to'xtatish (ma'lumotlar saqlanadi; -v qo'shmang, u ma'lumotlarni o'chiradi)
+docker cp spendwise:/data ./backup-$(date +%F) # zaxira nusxa
 ```
 
-### Where the data lives
+Ma'lumotlar `spendwise-data` Docker volume'ida turadi:
 ```
-/data/spendings/2026-09.xlsx   # one file per month
-/data/settings.json            # timezone, report time, etc.
+/data/users.json                     # foydalanuvchilar ro'yxati (faqat ID)
+/data/users/<telegram_id>/2026-09.xlsx   # har bir foydalanuvchi, har bir oy
 ```
-The data is only on the server, not in git. `.env` (the bot token) is in `.gitignore`, so it is never pushed.
-
-## How the monthly report works
-
-- The report job runs every day at the report time. It sends a file only on the last day of the month.
-- If the server was down at that moment, missed monthly reports (up to 3 months) are sent the next time the bot starts.
-- If sending fails, the bot retries every 5 minutes.
-- Each spending gets the time you sent the message in Telegram. Messages queued while the bot was offline keep their real time.
-- Date, Time and Amount are real Excel values, so you can sort, filter, sum and build pivot tables on them.
