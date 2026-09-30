@@ -1,6 +1,6 @@
 # Spendwise 💰
 
-Xarajatlarni hisoblab boruvchi Telegram bot. Interfeysi to'liq o'zbek tilida va istalgan odam foydalana oladi. Har bir foydalanuvchining ma'lumotlari alohida saqlanadi, o'z paroli bilan shifrlanadi va boshqalarga ko'rinmaydi.
+Xarajatlarni hisoblab boruvchi Telegram bot. Interfeysi to'liq o'zbek tilida va istalgan odam foydalana oladi. Har bir foydalanuvchining ma'lumotlari alohida saqlanadi, o'z paroli bilan shifrlanadi va boshqalarga ko'rinmaydi. Botni oilaviy guruhga qo'shib, umumiy xarajatni ham birga yuritish mumkin.
 
 ## Foydalanish
 
@@ -39,6 +39,38 @@ Qo'shimcha buyruqlar:
 | `/parol` | Parolni almashtirish |
 | `/tozalash` | Barcha ma'lumotlarni o'chirish (parol unutilganda ham shu) |
 
+## Guruh (oilaviy xarajat)
+
+Botni guruhga qo'shsangiz, a'zolar umumiy xarajatni birga yozadi va bot kim qancha sarflaganini hisoblab beradi. Shaxsiy xarajatlar guruhdan alohida qoladi va guruhga ko'rinmaydi.
+
+**Sozlash (bir marta)**
+1. Botni guruhga qo'shing. Botda guruh xabarlarini o'qish huquqi kerak emas: bot faqat buyruqlarga javob beradi va oddiy suhbatni o'qimaydi.
+2. Guruh admini botga shaxsiy chatda `/start` bosib parol o'rnatadi va kiritadi.
+3. Guruhda o'sha admin `/guruh` ni bosadi. Guruh admini bo'lmagan odam sozlay olmaydi.
+
+**Ishlatish (hamma a'zo)**
+
+| Buyruq | Nima qiladi |
+|---|---|
+| `/x 50000 non` | Xarajat yozish (kim yozgani saqlanadi) |
+| `/bugun` | Guruhning bugungi xarajatlari |
+| `/hafta`, `/oy`, `/oy 08.2026` | Hisobot: jami, **kim qancha sarflagani** va Excel (`Xarajatlar`, `Kunlik jami`, `Kim bo'yicha` varaqlari) |
+| `/royxat` | Shu oydagi xarajatlar raqamlari va ismlari bilan |
+| `/statistika` | Oxirgi 7 kun, oy jami, har kimning ulushi |
+| `/tahrir 3 45000 non`, `/ochirish 3`, `/bekor` | O'z yozuvini o'zgartirish/o'chirish. Birovning yozuviga faqat guruh admini tegadi |
+| `/qoshish 25.09 50000 non` | Boshqa kunga qo'shish |
+| `/hisobot` | Avtomatik hisobotlarni yoqish/o'chirish (faqat admin) |
+| `/guruh` | Guruh holati. `/guruh kalit`: boshqa admin ham kalit egasi bo'ladi |
+
+Avtomatik hisobotlar (yakshanba 12:00, oy oxirida 21:00) guruhning o'ziga yuboriladi. Guruh a'zolari botda ro'yxatdan o'tishi yoki parol qo'yishi shart emas.
+
+**Shifrlash.** Guruhda parol yozib bo'lmaydi (hamma ko'radi), shuning uchun guruh kaliti guruhni sozlagan adminning **shaxsiy kaliti** bilan o'raladi. Bot qayta ishga tushganda guruh qulflanadi va kalit egasi botga shaxsiy chatda parolini kiritishi bilan ochiladi. Shu paytgacha guruhda yozilgan `/x` (20 tagacha) xotirada turadi va guruh ochilgach saqlanadi. `/guruh kalit` bilan ikkinchi admin ham kalit egasi bo'lsa, guruh bitta odamga bog'liq bo'lib qolmaydi.
+
+**Esda tuting**
+- Kalit egasi `/tozalash` qilsa va u guruhning **yagona** kalit egasi bo'lsa, guruh ma'lumotlari ham o'chadi (bot avval ogohlantiradi).
+- Guruh a'zolarining ismlari (Telegram'dagi ko'rinadigan ismi) va ID'si shifrlangan faylning ichida turadi, `users.json`/`groups.json`da emas.
+- Oddiy guruh superguruhga aylansa, Telegram chat ID'sini o'zgartiradi: `/guruh` ni qayta bosib, yangidan boshlash kerak bo'ladi.
+
 ### Avtomatik hisobotlar (Toshkent vaqti)
 - **Haftalik:** har yakshanba soat 12:00 da (dushanba–yakshanba).
 - **Oylik:** oyning oxirgi kuni soat 21:00 da.
@@ -60,13 +92,13 @@ Maqsad: har bir foydalanuvchining ma'lumotini faqat o'sha odamning o'zi ocha oli
 - 5 marta noto'g'ri urinishdan keyin 10 daqiqa kutish qo'yiladi.
 - Boshqa foydalanuvchilar bir-birining ma'lumotini ko'ra olmaydi: har biri o'z papkasida (`data/users/<telegram_id>/`) va o'z kaliti bilan. Bot har so'rovda faqat yozgan odamning kalitini ishlatadi.
 - Botda administrator buyrug'i yo'q. Xabar matnlari va parollar logga yozilmaydi. `users.json`da faqat Telegram ID va hisobot holati bor, ism, username yoki telefon yo'q.
-- Bot faqat shaxsiy chatlarda ishlaydi.
+- Shaxsiy xarajatlar faqat shaxsiy chatda ko'rinadi. Guruhda bot faqat o'z buyruqlariga javob beradi va oddiy xabarlarni o'qimaydi. Guruh ma'lumoti alohida (`data/groups/<chat_id>/`) va guruh kaliti bilan shifrlangan (yuqoridagi «Guruh» bo'limiga qarang).
 
 **Muhim cheklovlar (halol ogohlantirish)**
 - **Parol unutilsa, ma'lumotni tiklab bo'lmaydi** (`/tozalash` bilan hammasini o'chirib, boshidan boshlash mumkin). Bu ataylab shunday: tiklash yo'li bo'lsa, server egasi ham foydalana olardi.
 - Telegram botlarida xabarlar end-to-end shifrlanmagan. Xabar Telegram serveri orqali o'tadi va bot kodi uni ochiq matn sifatida qayta ishlaydi. Server ustidan to'liq nazorati bor odam (root) botning kodini o'zgartirib yoki xotirasini o'qib, foydalanuvchi ochiq turgan paytda ma'lumotni ko'rishi **nazariy jihatdan mumkin**. Shifrlash quyidagilardan himoya qiladi: diskdagi fayllarni o'qish, zaxira nusxalar (`docker cp`), o'g'irlangan disk yoki server ma'lumoti sizib chiqishi. Shuning uchun bot egasiga ishonch baribir kerak.
 - Hisobotdagi Excel fayl Telegram chatiga ochiq holda yuboriladi, chunki foydalanuvchi uni telefonida ochishi kerak. Ularni chatda saqlash foydalanuvchining o'z ixtiyorida.
-- Diskda foydalanuvchining Telegram ID'si, fayl nomlari (oy) va fayl hajmi ko'rinib turadi.
+- Diskda foydalanuvchining Telegram ID'si, fayl nomlari (oy) va fayl hajmi ko'rinib turadi. Guruhlarda qo'shimcha ravishda kalit egalarining Telegram ID'si `vault.json`da ochiq turadi.
 
 ## O'rnatish (Ubuntu + Docker)
 
@@ -101,4 +133,7 @@ Ma'lumotlar `spendwise-data` Docker volume'ida turadi:
 /data/users.json                          # foydalanuvchilar ro'yxati (faqat ID va hisobot holati)
 /data/users/<telegram_id>/vault.json      # parol bilan o'ralgan kalit
 /data/users/<telegram_id>/2026-09.enc     # shifrlangan oylik fayl
+/data/groups.json                         # guruhlar ro'yxati (faqat chat ID va hisobot holati)
+/data/groups/<chat_id>/vault.json         # guruh kaliti, har bir kalit egasining kaliti bilan o'ralgan
+/data/groups/<chat_id>/2026-09.enc        # shifrlangan guruh xarajatlari (kim yozgani bilan)
 ```

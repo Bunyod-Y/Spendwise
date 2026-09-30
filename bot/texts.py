@@ -47,7 +47,23 @@ COMMANDS = [
     ("hisobot", "Avtomatik hisobotlarni yoqish/o'chirish"),
     ("parol", "Parolni almashtirish"),
     ("tozalash", "Barcha ma'lumotlarimni o'chirish"),
+    ("guruh", "Botni guruhga qo'shish haqida"),
     ("yordam", "Yordam"),
+]
+
+# Shown in group chats (BotCommandScopeAllGroupChats).
+GROUP_COMMANDS = [
+    ("x", "Xarajat yozish: /x 50000 non"),
+    ("bugun", "Guruhning bugungi xarajatlari"),
+    ("hafta", "Guruh haftalik hisoboti"),
+    ("oy", "Guruh oylik hisoboti va Excel"),
+    ("royxat", "Shu oydagi xarajatlar ro'yxati"),
+    ("statistika", "Kim qancha sarflagan"),
+    ("tahrir", "O'z xarajatingizni tahrirlash"),
+    ("ochirish", "O'z xarajatingizni o'chirish"),
+    ("bekor", "O'zingizning oxirgi xarajatingiz"),
+    ("hisobot", "Avtomatik hisobotlar (admin)"),
+    ("guruh", "Guruhni sozlash / holati"),
 ]
 
 WELCOME = """\
@@ -100,6 +116,8 @@ Boshqa:
 /hisobot: avtomatik hisobotlarni yoqish/o'chirish
 
 📊 Hisobotlar: har yakshanba 12:00 da haftalik, oyning oxirgi kuni 21:00 da oylik.
+
+👥 Oilaviy guruh: botni guruhga qo'shib, guruh admini /guruh ni bosadi. Keyin hamma /x 50000 non deb yozadi va umumiy xarajatni birga hisoblaydi (batafsil: /guruh).
 
 🔒 Xavfsizlik:
 /parol: parolni almashtirish
@@ -259,3 +277,93 @@ Davom etamizmi?"""
 BTN_WIPE_YES = "🗑 Ha, hammasini o'chir"
 WIPE_DONE = "🗑 Barcha ma'lumotlaringiz o'chirildi."
 WIPE_CANCELLED = "👌 Hech narsa o'chirilmadi."
+
+
+# ---------- groups ----------
+
+GROUP_PRIVATE_INFO = """\
+👥 Oilaviy guruh
+
+Botni guruhga qo'shsangiz, guruh a'zolari umumiy xarajatni birga yozib boradi va bot kim qancha sarflaganini hisoblab beradi.
+
+1️⃣ Botni guruhga qo'shing.
+2️⃣ Shaxsiy chatda parol o'rnating va kiriting (bu sizning kalitingiz).
+3️⃣ Guruhda admin /guruh ni bosadi.
+4️⃣ Endi guruhda hamma yozadi: /x 50000 non
+
+Guruh ma'lumoti guruhni sozlagan admin(lar)ning kaliti bilan shifrlanadi. Bot qayta ishga tushsa, o'sha admin botga shaxsiy chatda parolini kiritishi bilan guruh ham ochiladi.
+
+Shaxsiy xarajatlaringiz guruhdan alohida qoladi va guruhga ko'rinmaydi."""
+
+GROUP_NOT_SET_UP = "👥 Bu guruh hali sozlanmagan. Guruh admini /guruh ni bosishi kerak."
+GROUP_NEED_ADMIN = "❗ Guruhni faqat guruh admini sozlay oladi."
+GROUP_NEED_PERSONAL = (
+    "🔐 Avval botga shaxsiy chatda o'tib, /start bosing va parolingizni kiriting:\n{link}\n\n"
+    "Keyin bu yerda yana /guruh ni bosing."
+)
+GROUP_READY = """\
+✅ Guruh sozlandi!
+
+Endi guruhdagi har kim xarajat yoza oladi:
+   /x 50000 non
+   /x taksi 25 000
+   /x 1.5 mln ijara
+
+/bugun /hafta /oy /royxat /statistika: guruhning umumiy xarajati va kim qancha sarflagani.
+/tahrir, /ochirish, /bekor: har kim faqat o'z yozuvini o'zgartiradi (admin hammasini).
+
+🔒 Guruh ma'lumoti sizning kalitingiz bilan shifrlangan. Bot qayta ishga tushsa, botga shaxsiy chatda parolingizni kiriting, shunda guruh ochiladi."""
+GROUP_STATUS = """\
+👥 Guruh: {state}
+🔑 Kalit egalari: {holders} ta
+
+Yozish: /x 50000 non
+Kalit egalarini ko'paytirish (admin): /guruh kalit"""
+GROUP_STATE_OPEN = "🔓 ochiq"
+GROUP_STATE_LOCKED = "🔒 qulflangan (kalit egasi botga shaxsiy chatda parol kiritishi kerak)"
+GROUP_KEY_ADDED = "🔑 Endi siz ham guruh kalitining egasisiz: bot qayta ishga tushsa, siz parol kiritsangiz ham guruh ochiladi."
+GROUP_KEY_ALREADY = "🔑 Siz allaqachon kalit egasisiz."
+GROUP_KEY_NEED_OPEN = "🔒 Guruh hozir qulflangan. Avval boshqa kalit egasi uni ochishi kerak."
+GROUP_LOCKED = "🔒 Guruh ma'lumotlari qulflangan (bot qayta ishga tushgan). Guruhni sozlagan admin botga shaxsiy chatda parolini kiritishi kerak."
+GROUP_LOCKED_PENDING = "\n\n✍️ Yozgan xarajatingiz guruh ochilgach saqlanadi."
+GROUP_HELP = """\
+👥 Guruh xarajatlari
+
+/x 50000 non: xarajat yozish (har kim)
+/bugun: bugungi xarajatlar
+/hafta: haftalik hisobot + Excel
+/oy yoki /oy 08.2026: oylik hisobot + Excel
+/royxat: shu oydagi xarajatlar (raqamlari bilan)
+/statistika: kim qancha sarflagan
+/qoshish 25.09 50000 non: boshqa kunga qo'shish
+/tahrir 3 45000 non: o'z xarajatingizni o'zgartirish
+/ochirish 3: o'z xarajatingizni o'chirish
+/bekor: o'zingizning oxirgi xarajatingizni o'chirish
+/hisobot: avtomatik hisobotlarni yoqish/o'chirish (admin)
+/guruh: guruhni sozlash va holati
+
+📊 Hisobotlar: har yakshanba 12:00 da haftalik, oyning oxirgi kuni 21:00 da oylik."""
+
+USAGE_X = "Masalan: /x 50000 non"
+NOT_YOURS = "❗ Bu xarajatni faqat {name} yoki guruh admini o'zgartira oladi."
+NOT_YOUR_ENTRY = "Bu tugma sizniki emas."
+GROUP_REPORTS_ADMIN = "❗ Avtomatik hisobotlarni faqat guruh admini boshqaradi."
+GROUP_REPORTS_ON = "🔔 Guruh uchun avtomatik hisobotlar yoqildi (yakshanba 12:00 da haftalik, oy oxirida oylik)."
+GROUP_REPORTS_OFF = "🔕 Guruh uchun avtomatik hisobotlar o'chirildi. Qayta yoqish: /hisobot"
+WIPE_GROUPS_WARN = "\n\n⚠️ Siz {n} ta guruhning yagona kalit egasisiz: ularning ma'lumotlari ham o'chadi."
+
+
+def group_entry_line(number: int, when: datetime, amount: float, reason: str, name: str, with_date: bool = True) -> str:
+    stamp = f"{when:%d.%m %H:%M}" if with_date else f"{when:%H:%M}"
+    return f"{number}. {stamp}  {num(amount)}  {reason or 'izohsiz'}  ({name})"
+
+
+def member_breakdown(totals: list[tuple[str, float, int]]) -> str:
+    """'Kim qancha sarfladi' block from (name, total, count) rows."""
+    grand = sum(total for _, total, _ in totals) or 1
+    lines = ["👥 Kim qancha sarfladi:"]
+    lines += [
+        f"{i}. {name}: {money(total)} ({round(total / grand * 100)}%, {count} ta)"
+        for i, (name, total, count) in enumerate(totals, 1)
+    ]
+    return "\n".join(lines)
