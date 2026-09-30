@@ -8,6 +8,11 @@ The files are encrypted with a key that only the user's password can unlock
 (see vault.py). The unlocked key is kept in memory only, so after a restart
 each user has to enter their password again. Data older than 12 months is
 deleted automatically.
+
+Group chats keep their own shared spendings (data/groups/<chat_id>/). A group
+has no password; its key is wrapped with the personal key of each admin who
+set it up (see GroupVault), so unlocking your own vault also opens your groups.
+In groups the bot only reacts to commands and never reads ordinary messages.
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ import logging
 import os
 import re
 import shutil
+import zlib
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -25,6 +31,7 @@ from zoneinfo import ZoneInfo
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllGroupChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -32,6 +39,7 @@ from telegram import (
     Update,
 )
 from cryptography.fernet import Fernet
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import Forbidden, NetworkError, TelegramError
 from telegram.ext import (
     Application,
@@ -43,9 +51,9 @@ from telegram.ext import (
 )
 
 import texts as t
-from storage import SpendingStorage, encrypt_legacy, purge_old, shift_month
+from storage import GroupStorage, SpendingStorage, encrypt_legacy, member_totals, purge_old, shift_month
 from users import UserRegistry
-from vault import MAX_PASSWORD, MIN_PASSWORD, Vault
+from vault import MAX_PASSWORD, MIN_PASSWORD, GroupVault, Vault
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -68,12 +76,17 @@ MAX_PENDING = 20         # messages held in memory while a user is locked
 TG_LIMIT = 4000
 
 users = UserRegistry(DATA_DIR / "users.json")
+groups = UserRegistry(DATA_DIR / "groups.json")
 
 # Unlocked data keys, in memory only. Never written to disk or logged.
 CIPHERS: dict[int, Fernet] = {}
+GROUP_KEYS: dict[int, bytes] = {}
+# /x messages that arrived while their group was locked: chat id -> [(when, amount, reason, uid, name, msg)]
+GROUP_PENDING: dict[int, list] = {}
 
-# Private chats only; edits of old messages are ignored.
+# Personal commands work in private chats, group commands in groups; edits of old messages are ignored.
 PRIVATE = filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE
+GROUP = filters.ChatType.GROUPS & filters.UpdateType.MESSAGE
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     t.KEYBOARD, resize_keyboard=True, is_persistent=True,
@@ -129,12 +142,54 @@ def register(uid: int) -> None:
 
 
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> SpendingStorage | None:
-    """The sender's own unlocked storage, or None after asking for their password."""
+    """The storage this chat works on, or None after saying why not.
+
+    In a private chat that is the sender's own storage (asking for their password
+    if locked); in a group chat it is the group's. Group members are never
+    registered in users.json.
+    """
+    if update.effective_chat.type != ChatType.PRIVATE:
+        return await ggate(update, context)
     register(update.effective_user.id)
     store = store_for(update.effective_user.id)
     if store is None:
         await prompt_password(update, context)
     return store
+
+
+def group_dir(chat_id: int) -> Path:
+    return DATA_DIR / "groups" / str(int(chat_id))
+
+
+def group_store_for(chat_id: int) -> GroupStorage | None:
+    """The group's storage, or None while it is locked (no key holder has unlocked it)."""
+    key = GROUP_KEYS.get(int(chat_id))
+    return GroupStorage(group_dir(chat_id), Fernet(key)) if key else None
+
+
+async def ggate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> GroupStorage | None:
+    """The group's unlocked storage, or None after telling the chat why not."""
+    chat_id = update.effective_chat.id
+    if not GroupVault(group_dir(chat_id)).exists():
+        await update.effective_message.reply_text(t.GROUP_NOT_SET_UP)
+        return None
+    store = group_store_for(chat_id)
+    if store is None:
+        await update.effective_message.reply_text(t.GROUP_LOCKED)
+    return store
+
+
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+    except TelegramError:
+        return False
+    return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+def author_of(update: Update) -> tuple[int, str]:
+    user = update.effective_user
+    return user.id, " ".join(user.full_name.split())[:40] or "Noma'lum"
 
 
 def args_of(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -238,7 +293,10 @@ async def send_period_report(
     entries = store.entries_between(start, end)
     if not entries:
         return False
-    await bot.send_message(chat_id, t.summary(title, start, end, today(), entries, show_days))
+    text = t.summary(title, start, end, today(), entries, show_days)
+    if isinstance(store, GroupStorage):
+        text += "\n\n" + t.member_breakdown(store.member_totals(start, end))
+    await bot.send_message(chat_id, text)
     data, _, _ = store.export_range(start, end, "Xarajatlar")
     await bot.send_document(chat_id, document=data, filename=filename)
     return True
@@ -271,14 +329,15 @@ def due_month(current: datetime) -> tuple[int, int]:
     return prev_month(current.year, current.month)
 
 
-async def send_user_reports(bot: Bot, uid: int) -> bool:
-    """Send one user the latest weekly/monthly report they have not received yet.
+async def send_reports(
+    bot: Bot, registry: UserRegistry, chat_id: int, store: SpendingStorage | None
+) -> bool:
+    """Send a chat (a user or a group) the latest weekly/monthly report it has not received yet.
 
-    Locked users are skipped (their data cannot be read); they get the report
+    Locked chats are skipped (their data cannot be read); they get the report
     as soon as they unlock. Returns True if a network problem means "retry later".
     """
-    user = users.get(uid)
-    store = store_for(uid)
+    user = registry.get(chat_id)
     if user is None or store is None or not user.get("reports", True):
         return False
     current = now()
@@ -290,36 +349,47 @@ async def send_user_reports(bot: Bot, uid: int) -> bool:
         if user.get("last_week", "") < week:
             start = week_end - timedelta(days=6)
             await send_period_report(
-                bot, uid, store, "Haftalik hisobot", start, week_end,
+                bot, chat_id, store, "Haftalik hisobot", start, week_end,
                 week_filename(start, week_end), show_days=True,
             )
-            users.update(uid, last_week=week)
+            registry.update(chat_id, last_week=week)
         if user.get("last_month", "") < month:
             start, end = month_bounds(*ym)
             await send_period_report(
-                bot, uid, store, f"Oylik hisobot: {t.month_name(*ym)}", start, end,
+                bot, chat_id, store, f"Oylik hisobot: {t.month_name(*ym)}", start, end,
                 month_filename(*ym), show_days=False,
             )
-            users.update(uid, last_month=month)
+            registry.update(chat_id, last_month=month)
     except Forbidden:
         # The user blocked the bot; don't keep trying.
-        log.info("User %s blocked the bot, skipping reports", uid)
-        users.update(uid, last_week=week, last_month=month)
+        log.info("Chat %s blocked the bot, skipping reports", chat_id)
+        registry.update(chat_id, last_week=week, last_month=month)
     except NetworkError:
-        log.warning("Network error sending report to %s, will retry", uid)
+        log.warning("Network error sending report to %s, will retry", chat_id)
         return True
     except Exception:
-        log.exception("Report for user %s failed", uid)
-        users.update(uid, last_week=week, last_month=month)
+        log.exception("Report for chat %s failed", chat_id)
+        registry.update(chat_id, last_week=week, last_month=month)
     return False
 
 
+async def send_user_reports(bot: Bot, uid: int) -> bool:
+    return await send_reports(bot, users, uid, store_for(uid))
+
+
+async def send_group_reports(bot: Bot, chat_id: int) -> bool:
+    return await send_reports(bot, groups, chat_id, group_store_for(chat_id))
+
+
 async def send_due_reports(bot: Bot) -> bool:
-    """Send every unlocked user their due reports. True means "retry later"."""
+    """Send every unlocked user and group their due reports. True means "retry later"."""
     retry = False
     for uid in users.ids():
         retry |= await send_user_reports(bot, uid)
         await asyncio.sleep(0.1)  # stay well under Telegram's rate limits
+    for chat_id in groups.ids():
+        retry |= await send_group_reports(bot, chat_id)
+        await asyncio.sleep(0.1)
     return retry
 
 
@@ -339,13 +409,14 @@ def schedule_reports(app: Application) -> None:
 # ---------- retention ----------
 
 def purge_expired() -> int:
-    """Delete month files older than RETENTION_MONTHS for every user (no keys needed)."""
+    """Delete month files older than RETENTION_MONTHS for every user and group (no keys needed)."""
     current = today()
     keep_from = shift_month(current.year, current.month, -RETENTION_MONTHS)
-    root = DATA_DIR / "users"
-    if not root.is_dir():
-        return 0
-    deleted = sum(purge_old(d, keep_from) for d in root.iterdir() if d.is_dir())
+    deleted = sum(
+        purge_old(d, keep_from)
+        for root in (DATA_DIR / "users", DATA_DIR / "groups") if root.is_dir()
+        for d in root.iterdir() if d.is_dir()
+    )
     if deleted:
         log.info("Deleted %d expired month files", deleted)
     return deleted
@@ -417,6 +488,48 @@ async def flush_pending(update: Update, context: ContextTypes.DEFAULT_TYPE, stor
         await say(update, context, t.PENDING_SAVED.format(n=saved))
 
 
+def held_groups(uid: int) -> list[Path]:
+    """Directories of the groups whose key `uid` holds."""
+    root = DATA_DIR / "groups"
+    if not root.is_dir():
+        return []
+    return [d for d in root.iterdir() if d.is_dir() and uid in GroupVault(d).holders()]
+
+
+async def flush_group_pending(bot: Bot, chat_id: int) -> None:
+    """Save the /x messages that arrived while the group was locked."""
+    store = group_store_for(chat_id)
+    saved = 0
+    for when, amount, reason, uid, name, msg in GROUP_PENDING.pop(chat_id, []):
+        if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
+            break
+        store.append(when, amount, reason, (uid, name))
+        saved += 1
+        try:
+            await msg.set_reaction("👍")
+        except TelegramError:
+            pass
+    if saved:
+        await bot.send_message(chat_id, t.PENDING_SAVED.format(n=saved))
+
+
+async def open_groups_of(bot: Bot, uid: int, cipher: Fernet) -> None:
+    """A key holder just unlocked their vault: open the groups whose key they hold."""
+    for d in await asyncio.to_thread(held_groups, uid):
+        chat_id = int(d.name)
+        if chat_id in GROUP_KEYS:
+            continue
+        key = GroupVault(d).unlock(uid, cipher)
+        if key is None:  # the holder's vault was re-created since: this slot is dead
+            continue
+        GROUP_KEYS[chat_id] = key
+        try:
+            await flush_group_pending(bot, chat_id)
+            await send_group_reports(bot, chat_id)  # reports that were due while locked
+        except TelegramError:
+            log.warning("Could not post to group %s after unlocking it", chat_id)
+
+
 async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE, password: str) -> None:
     """One step of set / unlock / change-password. `password` is never logged or stored."""
     msg = update.effective_message
@@ -448,6 +561,7 @@ async def handle_password(update: Update, context: ContextTypes.DEFAULT_TYPE, pa
         await say(update, context, t.UNLOCKED + hint, reply_markup=MAIN_KEYBOARD)
         await flush_pending(update, context, store_for(uid))
         await send_user_reports(context.bot, uid)  # reports that were due while locked
+        await open_groups_of(context.bot, uid, cipher)
 
     elif state in ("set1", "chg1"):
         problem = password_problem(password)
@@ -626,11 +740,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await reply_long(update, "\n".join(lines))
 
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = await gate(update, context)
-    if store is None:
-        return
-    current = today()
+def last_7_days_lines(store: SpendingStorage, current: date) -> list[str]:
     days = [current - timedelta(days=offset) for offset in range(6, -1, -1)]
     recent = store.entries_between(days[0], current)
     totals = [sum(a for w, a, _ in recent if w.date() == d) for d in days]
@@ -638,6 +748,15 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["📈 Oxirgi 7 kun", ""]
     for day, total in zip(days, totals):
         lines.append(f"{t.weekday(day)} {day:%d.%m}  {t.num(total):>11}  {'▇' * round(total / peak * 10)}")
+    return lines
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await gate(update, context)
+    if store is None:
+        return
+    current = today()
+    lines = last_7_days_lines(store, current)
 
     month_entries = store.entries(current.year, current.month)
     month_total = sum(a for _, a, _ in month_entries)
@@ -683,7 +802,8 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
         await update.effective_message.reply_text(t.LIMIT_REACHED)
         return
-    number = store.insert_sorted(when, *parsed)
+    author = author_of(update) if isinstance(store, GroupStorage) else None
+    number = store.insert_sorted(when, *parsed, author=author)
     await update.effective_message.reply_text(
         t.ADDED.format(entry=t.entry_line(number, when, *parsed))
     )
@@ -751,6 +871,9 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if (query.data or "").startswith("gdel:"):
+        await on_group_delete(update, context)
+        return
     await query.answer()
     uid = query.from_user.id  # every action below acts on the tapping user's own data only
     data = query.data or ""
@@ -764,6 +887,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         clear_flow(context)
         context.user_data.pop("pending", None)
         shutil.rmtree(user_dir(uid), ignore_errors=True)
+        release_groups(uid)
         await query.edit_message_text(t.WIPE_DONE)
         await prompt_password(update, context)
     elif m := re.fullmatch(r"del:(\d{4}):(\d{1,2}):(\d+)", data):
@@ -793,14 +917,32 @@ async def cmd_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(t.PASSWORD_CHANGE_ASK_OLD, reply_markup=ReplyKeyboardRemove())
 
 
+def release_groups(uid: int) -> None:
+    """The user's vault is gone, so their group key slots are dead: drop them.
+
+    A group nobody else holds the key of can never be opened again, so it is deleted.
+    """
+    for d in held_groups(uid):
+        if GroupVault(d).remove_holder(uid) == 0:
+            chat_id = int(d.name)
+            shutil.rmtree(d, ignore_errors=True)
+            groups.remove(chat_id)
+            GROUP_KEYS.pop(chat_id, None)
+            GROUP_PENDING.pop(chat_id, None)
+            log.info("Group %s deleted: its last key holder wiped their data", chat_id)
+
+
 async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Delete all of the sender's data, also the way out when the password is forgotten."""
-    register(update.effective_user.id)
+    uid = update.effective_user.id
+    register(uid)
+    sole = [d for d in held_groups(uid) if GroupVault(d).holders() == [uid]]
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(t.BTN_WIPE_YES, callback_data="wipe:yes"),
         InlineKeyboardButton(t.BTN_NO, callback_data="wipe:no"),
     ]])
-    await update.effective_message.reply_text(t.WIPE_ASK, reply_markup=keyboard)
+    warning = t.WIPE_GROUPS_WARN.format(n=len(sole)) if sole else ""
+    await update.effective_message.reply_text(t.WIPE_ASK + warning, reply_markup=keyboard)
 
 
 async def clear_flow_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -808,17 +950,309 @@ async def clear_flow_on_command(update: Update, context: ContextTypes.DEFAULT_TY
     clear_flow(context)
 
 
-async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    register(uid)
-    enabled = not users.get(uid).get("reports", True)
+def toggle_reports(registry: UserRegistry, chat_id: int) -> bool:
+    """Flip automatic reports on/off for a user or group. Returns the new state."""
+    enabled = not registry.get(chat_id).get("reports", True)
     fields = {"reports": enabled}
     if enabled:
         # Don't send reports for the period while they were switched off.
         current = now()
         fields.update(last_week=due_week_end(current).isoformat(), last_month=month_key(*due_month(current)))
-    users.update(uid, **fields)
+    registry.update(chat_id, **fields)
+    return enabled
+
+
+async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    register(uid)
+    enabled = toggle_reports(users, uid)
     await update.effective_message.reply_text(t.REPORTS_ON if enabled else t.REPORTS_OFF)
+
+
+# ---------- group chats ----------
+# /hafta /oy /qoshish also work in groups: gate() hands them the group's storage.
+
+async def cmd_group_info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/guruh in a private chat: how to use the bot in a family group."""
+    register(update.effective_user.id)
+    await update.effective_message.reply_text(t.GROUP_PRIVATE_INFO, reply_markup=MAIN_KEYBOARD)
+
+
+async def g_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(t.GROUP_HELP)
+
+
+async def g_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/guruh: set the group up (admin with an unlocked vault), or show its status."""
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    vault = GroupVault(group_dir(chat_id))
+    if vault.exists():
+        if args_of(context)[:1] == ["kalit"]:
+            await add_key_holder(update, context, vault)
+            return
+        state = t.GROUP_STATE_OPEN if chat_id in GROUP_KEYS else t.GROUP_STATE_LOCKED
+        await msg.reply_text(t.GROUP_STATUS.format(state=state, holders=len(vault.holders())))
+        return
+    if not await is_admin(update, context):
+        await msg.reply_text(t.GROUP_NEED_ADMIN)
+        return
+    cipher = CIPHERS.get(user.id)
+    if cipher is None:
+        await msg.reply_text(t.GROUP_NEED_PERSONAL.format(link=f"https://t.me/{context.bot.username}"))
+        return
+    GROUP_KEYS[chat_id] = vault.create(user.id, cipher)
+    current = now()
+    groups.register(
+        chat_id, last_week=due_week_end(current).isoformat(), last_month=month_key(*due_month(current))
+    )
+    log.info("New group %s", chat_id)
+    await msg.reply_text(t.GROUP_READY)
+
+
+async def add_key_holder(update: Update, context: ContextTypes.DEFAULT_TYPE, vault: GroupVault) -> None:
+    """/guruh kalit: another admin also holds the key, so the group survives one person's loss."""
+    msg = update.effective_message
+    user = update.effective_user
+    key = GROUP_KEYS.get(update.effective_chat.id)
+    if key is None:
+        await msg.reply_text(t.GROUP_KEY_NEED_OPEN)
+    elif not await is_admin(update, context):
+        await msg.reply_text(t.GROUP_NEED_ADMIN)
+    elif user.id in vault.holders():
+        await msg.reply_text(t.GROUP_KEY_ALREADY)
+    elif (cipher := CIPHERS.get(user.id)) is None:
+        await msg.reply_text(t.GROUP_NEED_PERSONAL.format(link=f"https://t.me/{context.bot.username}"))
+    else:
+        vault.add_holder(user.id, cipher, key)
+        await msg.reply_text(t.GROUP_KEY_ADDED)
+
+
+def entry_stamp(when: datetime, amount: float, reason: str) -> str:
+    """Short fingerprint of an entry, so a stale button can never hit a different entry."""
+    return f"{when:%Y%m%d%H%M}{zlib.crc32(f'{amount}|{reason}'.encode()) & 0xFFFFFF:06x}"
+
+
+def group_numbered(store: GroupStorage, year: int, month: int) -> list[tuple]:
+    """(number, when, amount, reason, author id, author name) for the month."""
+    return [(i, *entry) for i, entry in enumerate(store.authored(year, month), 1)]
+
+
+async def g_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/x 50000 non: record a group spending."""
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    args = split_args(update, 1)
+    parsed = parse_spending(args[0]) if args else None
+    if parsed is None:
+        await msg.reply_text(t.USAGE_X)
+        return
+    if not GroupVault(group_dir(chat_id)).exists():
+        await msg.reply_text(t.GROUP_NOT_SET_UP)
+        return
+    author = author_of(update)
+    when = local_minute(msg.date)
+    store = group_store_for(chat_id)
+    if store is None:
+        # Locked: keep the spending in memory only, and save it once the group is opened.
+        pending = GROUP_PENDING.setdefault(chat_id, [])
+        kept = len(pending) < MAX_PENDING
+        if kept:
+            pending.append((when, *parsed, *author, msg))
+        await msg.reply_text(t.GROUP_LOCKED + (t.GROUP_LOCKED_PENDING if kept else ""))
+        return
+    if len(store.entries(when.year, when.month)) >= MAX_ENTRIES_PER_MONTH:
+        await msg.reply_text(t.LIMIT_REACHED)
+        return
+    store.append(when, *parsed, author)
+    try:
+        await msg.set_reaction("👍")
+    except TelegramError:
+        await msg.reply_text(t.SAVED_FALLBACK)
+
+
+async def g_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await ggate(update, context)
+    if store is None:
+        return
+    day = today()
+    entries = [e for e in group_numbered(store, day.year, day.month) if e[1] and e[1].date() == day]
+    if not entries:
+        await update.effective_message.reply_text(t.NO_TODAY)
+        return
+    total = sum(e[2] for e in entries)
+    lines = [f"📅 Bugun ({day:%d.%m}): {t.money(total)}", ""]
+    lines += [
+        t.group_entry_line(n, when, amount, reason, name, with_date=False)
+        for n, when, amount, reason, _, name in entries
+    ]
+    await reply_long(update, "\n".join(lines))
+
+
+async def g_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await ggate(update, context)
+    if store is None:
+        return
+    args = args_of(context)
+    ym = parse_month(args[0]) if args else (today().year, today().month)
+    if ym is None:
+        await update.effective_message.reply_text(t.USAGE_MONTH)
+        return
+    entries = group_numbered(store, *ym)
+    if not entries:
+        await update.effective_message.reply_text(t.NO_PERIOD)
+        return
+    total = sum(e[2] for e in entries)
+    lines = [f"📋 {t.month_name(*ym)}: {len(entries)} ta, jami {t.money(total)}", ""]
+    lines += [t.group_entry_line(n, when, amount, reason, name) for n, when, amount, reason, _, name in entries]
+    lines += ["", t.member_breakdown(member_totals([e[1:] for e in entries]))]
+    lines += ["", "✏️ /tahrir 3 45000 non   🗑 /ochirish 3"]
+    await reply_long(update, "\n".join(lines))
+
+
+async def g_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await ggate(update, context)
+    if store is None:
+        return
+    current = today()
+    lines = last_7_days_lines(store, current)
+    month = store.authored(current.year, current.month)
+    month_total = sum(e[1] for e in month)
+    lines += [
+        "",
+        f"🗓 {t.month_name(current.year, current.month)}",
+        f"💰 Jami: {t.money(month_total)} ({len(month)} ta)",
+        f"📉 Kunlik o'rtacha: {t.money(round(month_total / current.day))}",
+    ]
+    if month:
+        when, amount, reason, _, name = max(month, key=lambda e: e[1])
+        lines.append(f"🔝 Eng katta: {t.entry_short(amount, reason)} ({name}, {when:%d.%m})")
+        lines += ["", t.member_breakdown(member_totals(month))]
+    prev = prev_month(current.year, current.month)
+    if store.exists(*prev):
+        prev_total = sum(a for _, a, _ in store.entries(*prev))
+        lines += ["", f"⏮ {t.month_name(*prev)}: {t.money(prev_total)}"]
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def may_change(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, store: GroupStorage, year: int, month: int, number: int
+) -> bool:
+    """Only an entry's author or a group admin may change it. Replies and returns False otherwise."""
+    msg = update.effective_message
+    entries = store.authored(year, month)
+    if not 1 <= number <= len(entries):
+        await msg.reply_text(t.NOT_FOUND.format(n=number))
+        return False
+    entry = entries[number - 1]
+    if update.effective_user.id == entry[3]:
+        return True
+    if not await is_admin(update, context):
+        await msg.reply_text(t.NOT_YOURS.format(name=entry[4]))
+        return False
+    # The admin check took a moment: make sure the numbering did not shift meanwhile.
+    if store.authored(year, month)[number - 1:number] != [entry]:
+        await msg.reply_text(t.ALREADY_CHANGED)
+        return False
+    return True
+
+
+async def g_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await ggate(update, context)
+    if store is None:
+        return
+    args = split_args(update, 2)
+    parsed = parse_spending(args[1]) if len(args) == 2 else None
+    if not args or not args[0].isdigit() or parsed is None:
+        await update.effective_message.reply_text(t.USAGE_EDIT)
+        return
+    current = today()
+    number = int(args[0])
+    if not await may_change(update, context, store, current.year, current.month, number):
+        return
+    old = store.update(current.year, current.month, number, *parsed)
+    await update.effective_message.reply_text(
+        t.EDITED.format(entry=t.entry_short(*parsed), old=t.entry_short(old[1], old[2]))
+    )
+
+
+async def g_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    store = await ggate(update, context)
+    if store is None:
+        return
+    args = args_of(context)
+    if not args or not args[0].isdigit():
+        await update.effective_message.reply_text(t.USAGE_DELETE)
+        return
+    current = today()
+    number = int(args[0])
+    if not await may_change(update, context, store, current.year, current.month, number):
+        return
+    removed = store.delete(current.year, current.month, number)
+    await update.effective_message.reply_text(
+        t.DELETED.format(entry=t.entry_short(removed[1], removed[2]))
+    )
+
+
+async def g_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask for confirmation before deleting the sender's own latest spending of this month."""
+    store = await ggate(update, context)
+    if store is None:
+        return
+    current = today()
+    mine = [e for e in group_numbered(store, current.year, current.month) if e[4] == update.effective_user.id]
+    if not mine:
+        await update.effective_message.reply_text(t.NOTHING_TO_UNDO)
+        return
+    number, when, amount, reason, _, name = mine[-1]
+    # The fingerprint lets the callback notice that the numbering changed meanwhile.
+    token = f"{current.year}:{current.month}:{number}:{entry_stamp(when, amount, reason)}"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(t.BTN_YES_DELETE, callback_data=f"gdel:{token}"),
+        InlineKeyboardButton(t.BTN_NO, callback_data="keep"),
+    ]])
+    await update.effective_message.reply_text(
+        t.UNDO_CONFIRM.format(entry=t.entry_line(None, when, amount, reason)), reply_markup=keyboard,
+    )
+
+
+async def on_group_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    m = re.fullmatch(r"gdel:(\d{4}):(\d{1,2}):(\d+):(\d{12}[0-9a-f]{6})", query.data or "")
+    chat = query.message.chat
+    if not m or chat.type == ChatType.PRIVATE:
+        await query.answer()
+        return
+    year, month, number = int(m[1]), int(m[2]), int(m[3])
+    store = group_store_for(chat.id)
+    if store is None:  # the bot was restarted since the button was shown
+        await query.answer()
+        await query.edit_message_text(t.GROUP_LOCKED)
+        return
+    entries = store.authored(year, month)
+    entry = entries[number - 1] if 1 <= number <= len(entries) else None
+    if entry is None or entry[0] is None or entry_stamp(entry[0], entry[1], entry[2]) != m[4]:
+        await query.answer()
+        await query.edit_message_text(t.ALREADY_CHANGED)
+        return
+    if entry[3] != query.from_user.id:  # someone else pressed the button
+        await query.answer(t.NOT_YOUR_ENTRY, show_alert=True)
+        return
+    removed = store.delete(year, month, number)
+    await query.answer()
+    await query.edit_message_text(t.DELETED.format(entry=t.entry_short(removed[1], removed[2])))
+
+
+async def g_reports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if groups.get(chat_id) is None:
+        await update.effective_message.reply_text(t.GROUP_NOT_SET_UP)
+    elif not await is_admin(update, context):
+        await update.effective_message.reply_text(t.GROUP_REPORTS_ADMIN)
+    else:
+        enabled = toggle_reports(groups, chat_id)
+        await update.effective_message.reply_text(t.GROUP_REPORTS_ON if enabled else t.GROUP_REPORTS_OFF)
 
 
 BUTTONS = {
@@ -845,6 +1279,9 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([BotCommand(c, d) for c, d in t.COMMANDS])
+    await app.bot.set_my_commands(
+        [BotCommand(c, d) for c, d in t.GROUP_COMMANDS], scope=BotCommandScopeAllGroupChats()
+    )
     try:
         await app.bot.set_my_description(t.BOT_DESCRIPTION)
         await app.bot.set_my_short_description(t.BOT_SHORT_DESCRIPTION)
@@ -852,7 +1289,10 @@ async def post_init(app: Application) -> None:
         log.warning("Could not set bot description")
     schedule_reports(app)
     await asyncio.to_thread(purge_expired)
-    log.info("Spendwise started, %d users (all locked until they enter their password)", len(users.ids()))
+    log.info(
+        "Spendwise started, %d users and %d groups (all locked until a key holder enters their password)",
+        len(users.ids()), len(groups.ids()),
+    )
 
 
 def main() -> None:
@@ -874,10 +1314,31 @@ def main() -> None:
         "hisobot": cmd_reports,
         "parol": cmd_password,
         "tozalash": cmd_wipe,
+        "guruh": cmd_group_info,
+    }
+    group_handlers = {
+        "start": g_help,
+        "yordam": g_help,
+        "help": g_help,
+        "guruh": g_setup,
+        "x": g_add,
+        "bugun": g_today,
+        "hafta": cmd_week,
+        "oy": cmd_month,
+        "royxat": g_list,
+        "statistika": g_stats,
+        "qoshish": cmd_add,
+        "tahrir": g_edit,
+        "ochirish": g_delete,
+        "bekor": g_undo,
+        "hisobot": g_reports,
     }
     app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, clear_flow_on_command), group=-1)
     for name, callback in handlers.items():
         app.add_handler(CommandHandler(name, callback, filters=PRIVATE))
+    # In groups the bot only answers its own commands and never reads ordinary messages.
+    for name, callback in group_handlers.items():
+        app.add_handler(CommandHandler(name, callback, filters=GROUP))
     app.add_handler(MessageHandler(PRIVATE & filters.COMMAND, on_unknown_command))
     app.add_handler(MessageHandler(PRIVATE & filters.TEXT, on_text))
     app.add_handler(MessageHandler(PRIVATE & ~filters.TEXT, on_other))

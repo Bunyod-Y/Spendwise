@@ -79,3 +79,63 @@ class Vault:
             return None
         self._write(data_key, new_password)
         return Fernet(data_key)
+
+
+class GroupVault:
+    """Encryption key of one group chat.
+
+    A group has no password (a chat would show it to everyone). Instead its
+    random data key is wrapped once per *key holder* with that person's
+    personal data key, so a holder unlocking their own vault also opens the
+    group. Nothing readable is stored: without a holder's password the group's
+    files cannot be opened, not even by whoever runs the server.
+    """
+
+    def __init__(self, group_dir: Path):
+        self.dir = group_dir
+        self.path = group_dir / META_NAME
+
+    def exists(self) -> bool:
+        return self.path.exists()
+
+    def _slots(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        return json.loads(self.path.read_text(encoding="utf-8")).get("slots", {})
+
+    def _write(self, slots: dict[str, str]) -> None:
+        self.dir.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps({"v": 1, "slots": slots}), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def holders(self) -> list[int]:
+        return [int(uid) for uid in self._slots()]
+
+    def create(self, holder: int, holder_cipher: Fernet) -> bytes:
+        """Set up a new group. Returns the group's data key."""
+        data_key = Fernet.generate_key()
+        self._write({str(holder): holder_cipher.encrypt(data_key).decode()})
+        return data_key
+
+    def unlock(self, holder: int, holder_cipher: Fernet) -> bytes | None:
+        """The group's data key if `holder` holds a slot their key can open, else None."""
+        token = self._slots().get(str(holder))
+        if token is None:
+            return None
+        try:
+            return holder_cipher.decrypt(token.encode())
+        except InvalidToken:
+            return None
+
+    def add_holder(self, holder: int, holder_cipher: Fernet, data_key: bytes) -> None:
+        slots = self._slots()
+        slots[str(holder)] = holder_cipher.encrypt(data_key).decode()
+        self._write(slots)
+
+    def remove_holder(self, holder: int) -> int:
+        """Drop a holder's slot. Returns how many holders are left."""
+        slots = self._slots()
+        slots.pop(str(holder), None)
+        self._write(slots)
+        return len(slots)

@@ -25,12 +25,20 @@ HEADERS = ("Sana", "Vaqt", "Summa", "Izoh")
 WIDTHS = (12, 8, 16, 80)
 DAY_HEADERS = ("Sana", "Jami")
 DAY_WIDTHS = (12, 16)
+GROUP_HEADERS = HEADERS + ("Kim", "ID")  # ID (Telegram id) decides who may edit an entry
+GROUP_WIDTHS = (12, 8, 16, 60, 24, 14)
+EXPORT_GROUP_HEADERS = HEADERS + ("Kim",)
+EXPORT_GROUP_WIDTHS = GROUP_WIDTHS[:5]
+MEMBER_HEADERS = ("Kim", "Soni", "Jami")
+MEMBER_WIDTHS = (24, 8, 16)
 DATE_FORMAT = "DD.MM.YYYY"
 TIME_FORMAT = "HH:MM"
 TOP = Alignment(vertical="top")
 WRAP_TOP = Alignment(vertical="top", wrap_text=True)
 
 Spending = tuple[datetime, float, str]
+Author = tuple[int, str]                              # (Telegram id, display name)
+GroupSpending = tuple[datetime, float, str, int, str]  # Spending + author id and name
 
 
 def amount_format(amount: float) -> str:
@@ -81,7 +89,17 @@ def _write_reason(ws: Worksheet, row: int, reason: str) -> None:
     cell.alignment = WRAP_TOP
 
 
-def _write_row(ws: Worksheet, row: int, when: datetime, amount: float, reason: str) -> None:
+def _write_author(ws: Worksheet, row: int, name: str, uid: int | None = None) -> None:
+    cell = ws.cell(row=row, column=5, value=name)
+    cell.data_type = "s"  # a display name starting with "=" must not become a formula
+    cell.alignment = TOP
+    if uid is not None:
+        ws.cell(row=row, column=6, value=uid)
+
+
+def _write_row(
+    ws: Worksheet, row: int, when: datetime, amount: float, reason: str, author: Author | None = None
+) -> None:
     date_cell = ws.cell(row=row, column=1, value=when.date())
     date_cell.number_format = DATE_FORMAT
     date_cell.alignment = TOP
@@ -90,6 +108,8 @@ def _write_row(ws: Worksheet, row: int, when: datetime, amount: float, reason: s
     time_cell.alignment = TOP
     _write_amount(ws, row, amount)
     _write_reason(ws, row, reason)
+    if author is not None:
+        _write_author(ws, row, author[1], author[0])
 
 
 def _read_row(ws: Worksheet, row: int) -> Spending:
@@ -142,6 +162,11 @@ def encrypt_legacy(user_dir: Path, cipher: Fernet) -> int:
 
 
 class SpendingStorage:
+    headers = HEADERS
+    widths = WIDTHS
+    export_headers = HEADERS
+    export_widths = WIDTHS
+
     def __init__(self, user_dir: Path, cipher: Fernet):
         self.dir = user_dir
         self._cipher = cipher
@@ -169,7 +194,7 @@ class SpendingStorage:
         if not path.exists():
             self.dir.mkdir(parents=True, exist_ok=True)
             wb = Workbook()
-            _setup_sheet(wb.active, f"{month:02d}.{year}", HEADERS, WIDTHS)
+            _setup_sheet(wb.active, f"{month:02d}.{year}", self.headers, self.widths)
             self._save(wb, path)
         return path
 
@@ -198,17 +223,17 @@ class SpendingStorage:
             if entry[0] is not None and start <= entry[0].date() <= end
         ]
 
-    def append(self, when: datetime, amount: float, reason: str) -> int:
+    def append(self, when: datetime, amount: float, reason: str, author: Author | None = None) -> int:
         """Add a spending at the end of its month's file. Returns its number (1-based)."""
         path = self.ensure(when.year, when.month)
         wb = self._load(path)
         ws = wb.active
         row = ws.max_row + 1
-        _write_row(ws, row, when, amount, reason)
+        _write_row(ws, row, when, amount, reason, author)
         self._save(wb, path)
         return row - 1
 
-    def insert_sorted(self, when: datetime, amount: float, reason: str) -> int:
+    def insert_sorted(self, when: datetime, amount: float, reason: str, author: Author | None = None) -> int:
         """Add a spending in chronological position. Returns its number (1-based)."""
         path = self.ensure(when.year, when.month)
         wb = self._load(path)
@@ -220,7 +245,7 @@ class SpendingStorage:
                 row = r
                 ws.insert_rows(r)
                 break
-        _write_row(ws, row, when, amount, reason)
+        _write_row(ws, row, when, amount, reason, author)
         self._save(wb, path)
         return row - 1
 
@@ -264,13 +289,16 @@ class SpendingStorage:
 
         Returns (xlsx bytes, count, total).
         """
-        rows = self.entries_between(start, end)
+        rows = self._export_rows(start, end)
         wb = Workbook()
         ws = wb.active
-        _setup_sheet(ws, title, HEADERS, WIDTHS)
-        for when, amount, reason in rows:
-            _write_row(ws, ws.max_row + 1, when, amount, reason)
-        total = sum(amount for _, amount, _ in rows)
+        _setup_sheet(ws, title, self.export_headers, self.export_widths)
+        for when, amount, reason, *author in rows:
+            row = ws.max_row + 1
+            _write_row(ws, row, when, amount, reason)
+            if author:  # group entries: show who, but not their Telegram id
+                _write_author(ws, row, author[1])
+        total = sum(row[1] for row in rows)
         label = ws.cell(row=ws.max_row + 2, column=1, value="JAMI")
         label.font = Font(bold=True)
         total_cell = ws.cell(row=label.row, column=3, value=total)
@@ -278,7 +306,7 @@ class SpendingStorage:
         total_cell.number_format = amount_format(total)
 
         per_day: dict[date, float] = {}
-        for when, amount, _ in rows:
+        for when, amount, *_ in rows:
             per_day[when.date()] = per_day.get(when.date(), 0) + amount
         days = wb.create_sheet()
         _setup_sheet(days, "Kunlik jami", DAY_HEADERS, DAY_WIDTHS)
@@ -289,7 +317,74 @@ class SpendingStorage:
                 days.cell(row=days.max_row, column=1).number_format = DATE_FORMAT
                 days.cell(row=days.max_row, column=2).number_format = amount_format(per_day[day])
             day += timedelta(days=1)
+        self._extra_sheets(wb, rows)
 
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue(), len(rows), total
+
+    def _export_rows(self, start: date, end: date) -> list[tuple]:
+        return self.entries_between(start, end)
+
+    def _extra_sheets(self, wb: Workbook, rows: list[tuple]) -> None:
+        """Hook for subclasses to add more sheets to an export."""
+
+
+class GroupStorage(SpendingStorage):
+    """Spendings of a group chat: like a personal file, plus who wrote each entry."""
+
+    headers = GROUP_HEADERS
+    widths = GROUP_WIDTHS
+    export_headers = EXPORT_GROUP_HEADERS
+    export_widths = EXPORT_GROUP_WIDTHS
+
+    def authored(self, year: int, month: int) -> list[GroupSpending]:
+        """Like `entries`, same numbering, with the author's id and name added."""
+        path = self.path_for(year, month)
+        if not path.exists():
+            return []
+        wb = self._load(path, read_only=True)
+        try:
+            return [
+                (_read_when(d, t), amount or 0, reason or "", int(uid or 0), name or "")
+                for d, t, amount, reason, name, uid in wb.active.iter_rows(
+                    min_row=2, max_col=6, values_only=True
+                )
+                if d is not None or amount is not None
+            ]
+        finally:
+            wb.close()
+
+    def authored_between(self, start: date, end: date) -> list[GroupSpending]:
+        return [
+            entry
+            for year, month in iter_months(start, end)
+            for entry in self.authored(year, month)
+            if entry[0] is not None and start <= entry[0].date() <= end
+        ]
+
+    def member_totals(self, start: date, end: date) -> list[tuple[str, float, int]]:
+        """(name, total, count) per member, biggest spender first."""
+        return member_totals(self.authored_between(start, end))
+
+    def _export_rows(self, start: date, end: date) -> list[tuple]:
+        return self.authored_between(start, end)
+
+    def _extra_sheets(self, wb: Workbook, rows: list[tuple]) -> None:
+        sheet = wb.create_sheet()
+        _setup_sheet(sheet, "Kim bo'yicha", MEMBER_HEADERS, MEMBER_WIDTHS)
+        for name, total, count in member_totals(rows):
+            sheet.append((name, count, total))
+            sheet.cell(row=sheet.max_row, column=1).data_type = "s"
+            sheet.cell(row=sheet.max_row, column=3).number_format = amount_format(total)
+
+
+def member_totals(rows: list[GroupSpending]) -> list[tuple[str, float, int]]:
+    """Group entries by author id. The name shown is the one they used most recently."""
+    groups: dict[int, list] = {}
+    for _, amount, _, uid, name in rows:
+        entry = groups.setdefault(uid, [name, 0, 0])
+        entry[0] = name or entry[0]
+        entry[1] += amount
+        entry[2] += 1
+    return sorted(((n, total, count) for n, total, count in groups.values()), key=lambda g: -g[1])

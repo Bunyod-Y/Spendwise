@@ -1,7 +1,7 @@
 """Registry of bot users and their report bookkeeping (data/users.json).
 
 Only the Telegram user ID and report state are stored: no names, usernames
-or phone numbers.
+or phone numbers. Groups use the same class (data/groups.json), keyed by chat ID.
 """
 from __future__ import annotations
 
@@ -43,6 +43,10 @@ class UserRegistry:
     def update(self, uid: int, **fields) -> None:
         self._users[str(uid)].update(fields)
         self._save()
+
+    def remove(self, uid: int) -> None:
+        if self._users.pop(str(uid), None) is not None:
+            self._save()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
