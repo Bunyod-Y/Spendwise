@@ -1,7 +1,9 @@
-"""Excel storage for ONE user: one .xlsx per month (Sana | Vaqt | Summa | Izoh).
+"""Encrypted Excel storage for ONE user: one file per month (Sana | Vaqt | Summa | Izoh).
 
 Every user gets their own SpendingStorage pointing at their own directory,
 so one user's data is never read or written through another user's instance.
+Files are .xlsx workbooks encrypted with the user's data key (see vault.py);
+nothing readable is ever written to disk.
 
 Callers work with a single `datetime`; it is split into the date and time
 columns on write and combined again on read.
@@ -12,6 +14,8 @@ import io
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Iterator
+
+from cryptography.fernet import Fernet
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -96,19 +100,66 @@ def _read_row(ws: Worksheet, row: int) -> Spending:
     )
 
 
-def _save(wb: Workbook, path: Path) -> None:
-    # Write to a temp file then rename, so a crash never leaves a half-written file.
-    tmp = path.with_name(path.name + ".tmp")
-    wb.save(tmp)
-    tmp.replace(path)
+SUFFIX = ".enc"
+
+
+def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    index = year * 12 + (month - 1) + delta
+    return index // 12, index % 12 + 1
+
+
+def purge_old(user_dir: Path, keep_from: tuple[int, int]) -> int:
+    """Delete month files older than `keep_from` (year, month). Needs no key.
+
+    Returns the number of deleted files.
+    """
+    deleted = 0
+    if not user_dir.is_dir():
+        return 0
+    for path in user_dir.iterdir():
+        if path.suffix not in (SUFFIX, ".xlsx"):
+            continue
+        try:
+            year, month = map(int, path.stem.split("-"))
+        except ValueError:
+            continue
+        if (year, month) < keep_from:
+            path.unlink()
+            deleted += 1
+    return deleted
+
+
+def encrypt_legacy(user_dir: Path, cipher: Fernet) -> int:
+    """Encrypt any plaintext .xlsx month files left by older versions, then remove them."""
+    converted = 0
+    for path in list(user_dir.glob("*.xlsx")):
+        target = path.with_suffix(SUFFIX)
+        if not target.exists():
+            target.write_bytes(cipher.encrypt(path.read_bytes()))
+        path.unlink()
+        converted += 1
+    return converted
 
 
 class SpendingStorage:
-    def __init__(self, user_dir: Path):
+    def __init__(self, user_dir: Path, cipher: Fernet):
         self.dir = user_dir
+        self._cipher = cipher
+
+    def _load(self, path: Path, read_only: bool = False) -> Workbook:
+        data = self._cipher.decrypt(path.read_bytes())
+        return load_workbook(io.BytesIO(data), read_only=read_only)
+
+    def _save(self, wb: Workbook, path: Path) -> None:
+        buf = io.BytesIO()
+        wb.save(buf)
+        # Write to a temp file then rename, so a crash never leaves a half-written file.
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(self._cipher.encrypt(buf.getvalue()))
+        tmp.replace(path)
 
     def path_for(self, year: int, month: int) -> Path:
-        return self.dir / f"{year:04d}-{month:02d}.xlsx"
+        return self.dir / f"{year:04d}-{month:02d}{SUFFIX}"
 
     def exists(self, year: int, month: int) -> bool:
         return self.path_for(year, month).exists()
@@ -119,14 +170,14 @@ class SpendingStorage:
             self.dir.mkdir(parents=True, exist_ok=True)
             wb = Workbook()
             _setup_sheet(wb.active, f"{month:02d}.{year}", HEADERS, WIDTHS)
-            _save(wb, path)
+            self._save(wb, path)
         return path
 
     def entries(self, year: int, month: int) -> list[Spending]:
         path = self.path_for(year, month)
         if not path.exists():
             return []
-        wb = load_workbook(path, read_only=True)
+        wb = self._load(path, read_only=True)
         try:
             return [
                 (_read_when(d, t), amount or 0, reason or "")
@@ -150,17 +201,17 @@ class SpendingStorage:
     def append(self, when: datetime, amount: float, reason: str) -> int:
         """Add a spending at the end of its month's file. Returns its number (1-based)."""
         path = self.ensure(when.year, when.month)
-        wb = load_workbook(path)
+        wb = self._load(path)
         ws = wb.active
         row = ws.max_row + 1
         _write_row(ws, row, when, amount, reason)
-        _save(wb, path)
+        self._save(wb, path)
         return row - 1
 
     def insert_sorted(self, when: datetime, amount: float, reason: str) -> int:
         """Add a spending in chronological position. Returns its number (1-based)."""
         path = self.ensure(when.year, when.month)
-        wb = load_workbook(path)
+        wb = self._load(path)
         ws = wb.active
         row = ws.max_row + 1
         for r in range(2, ws.max_row + 1):
@@ -170,7 +221,7 @@ class SpendingStorage:
                 ws.insert_rows(r)
                 break
         _write_row(ws, row, when, amount, reason)
-        _save(wb, path)
+        self._save(wb, path)
         return row - 1
 
     def update(self, year: int, month: int, number: int, amount: float, reason: str) -> Spending | None:
@@ -178,7 +229,7 @@ class SpendingStorage:
         path = self.path_for(year, month)
         if not path.exists():
             return None
-        wb = load_workbook(path)
+        wb = self._load(path)
         ws = wb.active
         row = number + 1
         if number < 1 or row > ws.max_row:
@@ -186,7 +237,7 @@ class SpendingStorage:
         old = _read_row(ws, row)
         _write_amount(ws, row, amount)
         _write_reason(ws, row, reason)
-        _save(wb, path)
+        self._save(wb, path)
         return old
 
     def get(self, year: int, month: int, number: int) -> Spending | None:
@@ -198,14 +249,14 @@ class SpendingStorage:
         path = self.path_for(year, month)
         if not path.exists():
             return None
-        wb = load_workbook(path)
+        wb = self._load(path)
         ws = wb.active
         row = number + 1
         if number < 1 or row > ws.max_row:
             return None
         removed = _read_row(ws, row)
         ws.delete_rows(row)
-        _save(wb, path)
+        self._save(wb, path)
         return removed
 
     def export_range(self, start: date, end: date, title: str) -> tuple[bytes, int, float]:

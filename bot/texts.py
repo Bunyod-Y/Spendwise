@@ -45,6 +45,8 @@ COMMANDS = [
     ("ochirish", "Xarajatni o'chirish"),
     ("bekor", "Oxirgi xarajatni o'chirish"),
     ("hisobot", "Avtomatik hisobotlarni yoqish/o'chirish"),
+    ("parol", "Parolni almashtirish"),
+    ("tozalash", "Barcha ma'lumotlarimni o'chirish"),
     ("yordam", "Yordam"),
 ]
 
@@ -63,7 +65,9 @@ Saqlaganimni 👍 belgisi bilan bildiraman.
 
 📊 Har yakshanba soat 12:00 da haftalik, oyning oxirgi kuni soat 21:00 da oylik hisobot yuboraman.
 
-🔒 Ma'lumotlaringiz boshqa foydalanuvchilarga ko'rinmaydi.
+🔒 Ma'lumotlaringiz parol bilan shifrlanadi: ularni faqat siz ocha olasiz, boshqa foydalanuvchilar ham, bot egasi ham ko'ra olmaydi.
+
+🗓 Oxirgi 12 oylik ma'lumot saqlanadi, undan eskisi avtomatik o'chiriladi.
 
 Pastdagi tugmalardan foydalaning 👇"""
 
@@ -95,7 +99,13 @@ Boshqa:
 /oy 08.2026: boshqa oy hisoboti
 /hisobot: avtomatik hisobotlarni yoqish/o'chirish
 
-📊 Hisobotlar: har yakshanba 12:00 da haftalik, oyning oxirgi kuni 21:00 da oylik."""
+📊 Hisobotlar: har yakshanba 12:00 da haftalik, oyning oxirgi kuni 21:00 da oylik.
+
+🔒 Xavfsizlik:
+/parol: parolni almashtirish
+/tozalash: barcha ma'lumotlaringizni o'chirish (parol unutilganda ham shu)
+Ma'lumotlar parolingiz bilan shifrlangan, parolni bot egasi ham bilmaydi. Parol unutilsa, uni tiklab bo'lmaydi.
+🗓 Faqat oxirgi 12 oy saqlanadi, eskisi avtomatik o'chiriladi."""
 
 NOT_UNDERSTOOD = (
     "🤔 Summani topa olmadim.\n\n"
@@ -209,3 +219,43 @@ def summary(title: str, start: date, end: date, today: date, entries, show_days:
         lines += ["", "🔝 Eng ko'p sarflangan:"]
         lines += [f"{i}. {label}: {money(amount)}" for i, (label, amount) in enumerate(top, 1)]
     return "\n".join(lines)
+
+
+# ---------- password / security ----------
+
+PASSWORD_INTRO = """🔐 Avval parol o'rnatamiz.
+
+Ma'lumotlaringiz shu parol bilan shifrlanadi, shuning uchun uni faqat siz ocha olasiz: bot egasi ham, boshqa foydalanuvchilar ham ko'ra olmaydi.
+
+⚠️ Parolni unutsangiz, ma'lumotlarni tiklab bo'lmaydi.
+⚠️ Bot qayta ishga tushganda (masalan, yangilanganda) parolni qayta kiritishingiz kerak bo'ladi.
+
+Kamida 6 belgidan iborat parolni yozing 👇
+(Parol yozilgan xabarni bot avtomatik o'chirishga harakat qiladi.)"""
+PASSWORD_AGAIN = "Yaxshi. Xatosiz bo'lishi uchun parolni yana bir marta yozing 👇"
+PASSWORD_TOO_SHORT = "❗ Parol kamida 6 belgidan iborat bo'lishi kerak. Qayta yozing 👇"
+PASSWORD_TOO_LONG = "❗ Parol juda uzun (ko'pi bilan 128 belgi). Qayta yozing 👇"
+PASSWORD_MISMATCH = "❗ Parollar bir xil emas. Boshidan boshlaymiz, parolni yozing 👇"
+PASSWORD_SET = "✅ Parol o'rnatildi. Endi xarajatlarni yozishingiz mumkin!"
+PASSWORD_CHANGED = "✅ Parol almashtirildi."
+LEGACY_ENCRYPTED = "🔐 Oldingi ma'lumotlaringiz ham shifrlandi."
+PASSWORD_CHANGE_ASK_OLD = "🔑 Hozirgi parolingizni yozing 👇"
+PASSWORD_CHANGE_ASK_NEW = "Yangi parolni yozing (kamida 6 belgi) 👇"
+PASSWORD_DELETE_HINT = "🧹 Parol yozilgan xabarni chatdan o'chirib qo'ying."
+
+LOCKED = """🔒 Ma'lumotlaringiz qulflangan.
+
+Ochish uchun parolingizni yozing 👇
+(Parolni unutgan bo'lsangiz: /tozalash, lekin bu barcha ma'lumotlarni o'chiradi.)"""
+LOCKED_PENDING = "\n\n✍️ Yuborgan xarajatingiz parol kiritilgach saqlanadi."
+UNLOCKED = "🔓 Ochildi. Xush kelibsiz!"
+WRONG_PASSWORD = "❌ Parol noto'g'ri. Qayta urinib ko'ring 👇"
+TOO_MANY_ATTEMPTS = "⏳ Juda ko'p noto'g'ri urinish. {minutes} daqiqadan keyin qayta urinib ko'ring."
+PENDING_SAVED = "✅ Kutib turgan {n} ta xarajat saqlandi."
+
+WIPE_ASK = """⚠️ Barcha xarajatlaringiz butunlay o'chiriladi va tiklab bo'lmaydi. Parol ham bekor bo'ladi.
+
+Davom etamizmi?"""
+BTN_WIPE_YES = "🗑 Ha, hammasini o'chir"
+WIPE_DONE = "🗑 Barcha ma'lumotlaringiz o'chirildi."
+WIPE_CANCELLED = "👌 Hech narsa o'chirilmadi."
